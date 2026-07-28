@@ -89,10 +89,17 @@ gh release create v1.0.0 dist/* --title v1.0.0
 
 Just run the binary — everything is interactive:
 
-- **arrows / j k** move · **enter** select · **space** toggle multi-selects
+- **arrows / j k** move · **enter** select (on forms: next field) · **space**
+  toggle
 - **esc** goes back to the previous screen at any point
 - **q** quits from menus; **ctrl+c** during a run stops gracefully
-  (a second ctrl+c force-kills)
+  (a second ctrl+c force-kills); the run log scrolls with **↑/↓ / pgup/pgdn**
+- `vip-index-supervisor --version` prints the release the binary was built from
+
+The options step has an **Advanced ▸** screen for the rare overrides: a forced
+resume object ID, a custom state directory, the stall timeout, and ignoring
+the state-dir lock. Attempt logs older than 14 days are pruned automatically
+at the start of each run.
 
 The first screen picks how WordPress is reached:
 

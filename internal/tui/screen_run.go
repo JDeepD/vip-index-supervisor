@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/reflow/truncate"
 
@@ -28,6 +30,8 @@ type runScreen struct {
 
 	state    supervise.Snapshot
 	log      []supervise.LogEvent
+	logView  viewport.Model
+	follow   bool // stick to the newest line unless the user scrolled up
 	done     bool
 	exitCode int
 	doneMsg  string
@@ -39,17 +43,34 @@ type runScreen struct {
 
 func newRunScreen(cfg supervise.Config) *runScreen {
 	return &runScreen{
-		id:     screenSerial.Add(1),
-		cfg:    cfg,
-		sup:    supervise.New(cfg),
-		width:  80,
-		height: 24,
+		id:      screenSerial.Add(1),
+		cfg:     cfg,
+		sup:     supervise.New(cfg),
+		logView: viewport.New(76, 10),
+		follow:  true,
+		width:   80,
+		height:  24,
 	}
 }
 
 func (s *runScreen) Title() string { return "running" }
 
-func (s *runScreen) SetSize(w, h int) { s.width, s.height = w, h }
+func (s *runScreen) SetSize(w, h int) {
+	if w <= 0 || h <= 0 {
+		return
+	}
+	s.width, s.height = w, h
+	s.logView.Width = max(40, w-6)
+	s.logView.Height = s.logHeight()
+	s.refreshLog()
+}
+
+// logHeight is whatever vertical space the fixed parts leave over, so a small
+// terminal shows fewer lines instead of overflowing the screen.
+func (s *runScreen) logHeight() int {
+	reserved := 8 + len(s.state.Phases)
+	return max(3, s.height-reserved)
+}
 
 // OwnsEsc while running: backing out of a live run must be a deliberate
 // Ctrl+C, not one stray keypress.
@@ -98,12 +119,34 @@ func (s *runScreen) apply(event supervise.Event) {
 		s.state = e.State
 	case supervise.LogEvent:
 		s.log = append(s.log, e)
-		if len(s.log) > 500 {
-			s.log = s.log[len(s.log)-500:]
+		if len(s.log) > 2000 {
+			s.log = s.log[len(s.log)-2000:]
 		}
+		s.refreshLog()
 	case supervise.DoneEvent:
 		s.exitCode = e.ExitCode
 		s.doneMsg = e.Message
+	}
+}
+
+func (s *runScreen) refreshLog() {
+	var b strings.Builder
+	for _, e := range s.log {
+		stamp := styleDim.Render(e.Time.Format(time.TimeOnly) + "  ")
+		line := e.Message
+		switch e.Level {
+		case supervise.LevelOK:
+			line = styleOK.Render(line)
+		case supervise.LevelWarn:
+			line = styleWarn.Render(line)
+		case supervise.LevelError:
+			line = styleErr.Render(line)
+		}
+		b.WriteString(truncateLine(stamp+line, s.logView.Width) + "\n")
+	}
+	s.logView.SetContent(b.String())
+	if s.follow {
+		s.logView.GotoBottom()
 	}
 }
 
@@ -115,13 +158,27 @@ func (s *runScreen) handleKey(key tea.KeyMsg) (Screen, tea.Cmd) {
 		case "enter", "esc":
 			return s, pop()
 		}
-		return s, nil
+		return s.scroll(key)
 	}
 	if key.String() == "ctrl+c" {
 		s.stops++
 		// First Ctrl+C lets the child finish its batch and checkpoint; the
 		// second stops asking nicely.
 		s.sup.RequestStop(s.stops > 1)
+		return s, nil
+	}
+	return s.scroll(key)
+}
+
+// scroll feeds navigation keys to the log viewport. Scrolling up detaches
+// from the live tail; returning to the bottom re-attaches it.
+func (s *runScreen) scroll(key tea.KeyMsg) (Screen, tea.Cmd) {
+	switch key.String() {
+	case "up", "down", "pgup", "pgdown", "home", "end", "k", "j":
+		var cmd tea.Cmd
+		s.logView, cmd = s.logView.Update(key)
+		s.follow = s.logView.AtBottom()
+		return s, cmd
 	}
 	return s, nil
 }
@@ -131,7 +188,7 @@ func (s *runScreen) View() string {
 	b.WriteString(s.headerView())
 	b.WriteString(s.phasesView())
 	b.WriteString(s.progressView())
-	b.WriteString(s.logView())
+	b.WriteString(s.renderLog())
 	b.WriteString(s.helpView())
 	return b.String()
 }
@@ -211,38 +268,25 @@ func (s *runScreen) progressView() string {
 	return b.String()
 }
 
-func (s *runScreen) logView() string {
-	// The log gets whatever vertical space the fixed parts leave over, so a
-	// small terminal shows fewer lines instead of overflowing the screen.
-	reserved := 8 + len(s.state.Phases)
-	visible := max(3, s.height-reserved)
-	start := max(0, len(s.log)-visible)
-
-	var b strings.Builder
-	for _, e := range s.log[start:] {
-		stamp := styleDim.Render(e.Time.Format("15:04:05") + "  ")
-		line := e.Message
-		switch e.Level {
-		case supervise.LevelOK:
-			line = styleOK.Render(line)
-		case supervise.LevelWarn:
-			line = styleWarn.Render(line)
-		case supervise.LevelError:
-			line = styleErr.Render(line)
-		}
-		b.WriteString(truncateLine(stamp+line, s.width-4) + "\n")
+func (s *runScreen) renderLog() string {
+	if s.logView.Height != s.logHeight() {
+		s.logView.Height = s.logHeight()
 	}
-	return b.String()
+	scrollNote := ""
+	if !s.follow {
+		scrollNote = styleWarn.Render(fmt.Sprintf(" ── scrolled to %3.0f%% — end to re-follow ──", s.logView.ScrollPercent()*100)) + "\n"
+	}
+	return scrollNote + s.logView.View() + "\n"
 }
 
 func (s *runScreen) helpView() string {
 	if s.done {
-		return styleHelp.Render("enter/esc back · q quit")
+		return styleHelp.Render("↑/↓ scroll log · enter/esc back · q quit")
 	}
 	if s.stops > 0 {
 		return styleHelp.Render("ctrl+c again to force-kill")
 	}
-	return styleHelp.Render("ctrl+c stop gracefully (progress is checkpointed) · logs: " +
+	return styleHelp.Render("↑/↓ scroll log · ctrl+c stop gracefully (progress is checkpointed) · logs: " +
 		s.cfg.StateDir)
 }
 

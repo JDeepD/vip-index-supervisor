@@ -41,14 +41,15 @@ func pop() tea.Cmd          { return func() tea.Msg { return popMsg{} } }
 
 // App is the root model: a screen stack plus terminal geometry.
 type App struct {
-	stack  []Screen
-	width  int
-	height int
+	stack   []Screen
+	version string
+	width   int
+	height  int
 }
 
 // NewApp starts at the target-selection screen.
-func NewApp() *App {
-	return &App{stack: []Screen{newTargetScreen()}}
+func NewApp(version string) *App {
+	return &App{stack: []Screen{newTargetScreen()}, version: version}
 }
 
 func (a *App) Init() tea.Cmd { return a.top().Init() }
@@ -115,7 +116,7 @@ func (a *App) handleGlobalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 func (a *App) View() string {
 	var b strings.Builder
 	b.WriteString(styleTitle.Render("vip-index supervisor"))
-	b.WriteString(styleDim.Render("  ·  " + a.breadcrumb()))
+	b.WriteString(styleDim.Render(" " + a.version + "  ·  " + a.breadcrumb()))
 	b.WriteString("\n\n")
 	b.WriteString(a.top().View())
 	return styleFrame.Render(b.String())

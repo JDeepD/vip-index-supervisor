@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -253,22 +254,26 @@ func (s *strategyScreen) View() string {
 // -- index wizard: options form ----------------------------------------------
 
 const (
-	fieldPerPage = iota
-	fieldShowErrors
-	fieldBudget
-	fieldContinue
+	optPerPage = iota
+	optShowErrors
+	optBudget
 )
 
 type optionsScreen struct {
 	sess    *session
-	cursor  int
-	perPage string
-	budget  string
+	form    *form
 	errText string
 }
 
 func newOptionsScreen(sess *session) *optionsScreen {
-	return &optionsScreen{sess: sess, perPage: strconv.Itoa(sess.perPage)}
+	return &optionsScreen{sess: sess, form: &form{
+		fields: []formField{
+			{label: "Objects per cycle (1–5000)", kind: kindText, text: strconv.Itoa(sess.perPage)},
+			{label: "Show verbose indexer errors", kind: kindToggle, on: sess.showErrors},
+			{label: "Wall-clock budget (e.g. 90m, 6h)", kind: kindText, placeholder: "unlimited"},
+		},
+		actions: []string{"Continue ▶", "Advanced ▸"},
+	}}
 }
 
 func (s *optionsScreen) Title() string { return "options" }
@@ -279,108 +284,159 @@ func (s *optionsScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	if !ok {
 		return s, nil
 	}
-	switch key.String() {
-	case "up":
-		if s.cursor > 0 {
-			s.cursor--
-		}
-	case "down", "tab":
-		if s.cursor < fieldContinue {
-			s.cursor++
-		}
-	case " ":
-		if s.cursor == fieldShowErrors {
-			s.sess.showErrors = !s.sess.showErrors
-		} else if s.cursor == fieldContinue {
-			return s.submit()
-		}
-	case "enter":
-		if s.cursor == fieldShowErrors {
-			s.sess.showErrors = !s.sess.showErrors
-			return s, nil
-		}
-		return s.submit()
-	case "backspace":
-		s.editField(func(v string) string {
-			if len(v) > 0 {
-				return v[:len(v)-1]
-			}
-			return v
-		})
-	default:
-		if text := key.String(); len(text) == 1 {
-			s.editField(func(v string) string { return v + text })
-		}
+	action := s.form.Update(key)
+	if action == "" {
+		s.errText = ""
+		return s, nil
 	}
-	return s, nil
+	if !s.apply() {
+		return s, nil
+	}
+	if action == "Advanced ▸" {
+		return s, push(newAdvancedScreen(s.sess))
+	}
+	return s, push(newConfirmScreen(s.sess))
 }
 
-func (s *optionsScreen) editField(apply func(string) string) {
-	switch s.cursor {
-	case fieldPerPage:
-		s.perPage = apply(s.perPage)
-	case fieldBudget:
-		s.budget = apply(s.budget)
-	}
-	s.errText = ""
-}
-
-func (s *optionsScreen) submit() (Screen, tea.Cmd) {
-	perPage, err := strconv.Atoi(strings.TrimSpace(s.perPage))
+// apply validates the form into the session; false leaves the cursor on the
+// offending field with an explanation.
+func (s *optionsScreen) apply() bool {
+	perPage, err := strconv.Atoi(strings.TrimSpace(s.form.fields[optPerPage].text))
 	if err != nil || perPage < 1 || perPage > 5000 {
 		s.errText = "objects per cycle must be a number between 1 and 5000"
-		s.cursor = fieldPerPage
-		return s, nil
+		s.form.FocusField(optPerPage)
+		return false
 	}
-	budget, err := parseBudget(s.budget)
+	budget, err := parseBudget(s.form.fields[optBudget].text)
 	if err != nil {
 		s.errText = "budget looks wrong — try 90m, 6h, 1h30m, or leave it empty"
-		s.cursor = fieldBudget
-		return s, nil
+		s.form.FocusField(optBudget)
+		return false
 	}
 	s.sess.perPage = perPage
+	s.sess.showErrors = s.form.fields[optShowErrors].on
 	s.sess.maxDuration = budget
-	return s, push(newConfirmScreen(s.sess))
+	return true
 }
 
 func (s *optionsScreen) View() string {
 	var b strings.Builder
 	b.WriteString(styleHeading.Render("Indexing options") + "\n\n")
-
-	b.WriteString(s.fieldRow(fieldPerPage, "Objects per cycle (1–5000)", s.perPage+"▏"))
-	toggle := "off"
-	if s.sess.showErrors {
-		toggle = styleOK.Render("on")
-	}
-	b.WriteString(s.fieldRow(fieldShowErrors, "Show verbose indexer errors", toggle))
-	budget := s.budget
-	if budget == "" {
-		budget = styleDim.Render("unlimited")
-	} else {
-		budget += "▏"
-	}
-	b.WriteString(s.fieldRow(fieldBudget, "Wall-clock budget (e.g. 90m, 6h)", budget))
-	b.WriteString("\n" + s.fieldRow(fieldContinue, styleAccent.Render("Continue ▶"), ""))
-
+	b.WriteString(s.form.View())
 	if s.errText != "" {
 		b.WriteString("\n" + styleErr.Render("  ✗ "+s.errText) + "\n")
 	}
-	b.WriteString(styleHelp.Render("↑/↓ move · type to edit · space toggle · enter continue · esc back"))
+	b.WriteString(styleHelp.Render("↑/↓ move · type to edit · space toggle · enter next/select · esc back"))
 	return b.String()
 }
 
-func (s *optionsScreen) fieldRow(field int, label, value string) string {
-	cursor := "  "
-	if s.cursor == field {
-		cursor = styleCursor.Render("❯ ")
-		label = styleCursor.Render(label)
+// -- index wizard: advanced options -------------------------------------------
+
+const (
+	advResumeFrom = iota
+	advStateDir
+	advStallTimeout
+	advIgnoreLock
+)
+
+type advancedScreen struct {
+	sess    *session
+	form    *form
+	errText string
+}
+
+func newAdvancedScreen(sess *session) *advancedScreen {
+	return &advancedScreen{sess: sess, form: &form{
+		fields: []formField{
+			{label: "Resume from object ID", kind: kindText,
+				text: textIfPositive(sess.resumeFrom), placeholder: "auto (checkpoint / live resume point)"},
+			{label: "State directory", kind: kindText,
+				text: sess.stateDir, placeholder: "default: ~/.vip-reindex/<target>"},
+			{label: "Stall timeout (e.g. 10m)", kind: kindText,
+				text: textIfDuration(sess.stallTimeout), placeholder: "default: 10m"},
+			{label: "Ignore the state-dir lock", kind: kindToggle, on: sess.ignoreLock},
+		},
+		actions: []string{"Done ✓"},
+	}}
+}
+
+func (s *advancedScreen) Title() string { return "advanced" }
+func (s *advancedScreen) Init() tea.Cmd { return nil }
+
+func (s *advancedScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
+	key, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return s, nil
 	}
-	if value == "" {
-		return cursor + label + "\n"
+	if s.form.Update(key) == "" {
+		s.errText = ""
+		return s, nil
 	}
-	// Pad by display width, not fmt's byte width: the highlighted label
-	// carries ANSI colour codes that %-38s would count as padding.
-	return cursor + padRight(label, 39) + value + "\n"
+	if !s.apply() {
+		return s, nil
+	}
+	return s, pop()
+}
+
+func (s *advancedScreen) apply() bool {
+	resumeText := strings.TrimSpace(s.form.fields[advResumeFrom].text)
+	var resumeFrom int64
+	if resumeText != "" {
+		n, err := strconv.ParseInt(resumeText, 10, 64)
+		if err != nil || n <= 0 {
+			s.errText = "resume ID must be a positive number, or empty for automatic"
+			s.form.FocusField(advResumeFrom)
+			return false
+		}
+		if len(s.sess.indexables) > 1 {
+			s.errText = "a forced resume ID only makes sense with a single indexable"
+			s.form.FocusField(advResumeFrom)
+			return false
+		}
+		if s.sess.strategy == supervise.StrategySetup {
+			s.errText = "a rebuild in place starts from the top — a resume ID cannot apply"
+			s.form.FocusField(advResumeFrom)
+			return false
+		}
+		resumeFrom = n
+	}
+	stall, err := parseBudget(s.form.fields[advStallTimeout].text)
+	if err != nil {
+		s.errText = "stall timeout looks wrong — try 10m or 600"
+		s.form.FocusField(advStallTimeout)
+		return false
+	}
+	s.sess.resumeFrom = resumeFrom
+	s.sess.stateDir = strings.TrimSpace(s.form.fields[advStateDir].text)
+	s.sess.stallTimeout = stall
+	s.sess.ignoreLock = s.form.fields[advIgnoreLock].on
+	return true
+}
+
+func (s *advancedScreen) View() string {
+	var b strings.Builder
+	b.WriteString(styleHeading.Render("Advanced options") + "\n")
+	b.WriteString(styleDim.Render("Defaults are right for almost every run; change these only on purpose.") + "\n\n")
+	b.WriteString(s.form.View())
+	if s.errText != "" {
+		b.WriteString("\n" + styleErr.Render("  ✗ "+s.errText) + "\n")
+	}
+	b.WriteString(styleHelp.Render("↑/↓ move · type to edit · space toggle · enter next/done · esc back"))
+	return b.String()
+}
+
+func textIfPositive(n int64) string {
+	if n > 0 {
+		return strconv.FormatInt(n, 10)
+	}
+	return ""
+}
+
+func textIfDuration(d time.Duration) string {
+	if d > 0 {
+		return d.String()
+	}
+	return ""
 }
 
 // -- confirm ------------------------------------------------------------------
@@ -479,6 +535,15 @@ func (s *confirmScreen) View() string {
 	b.WriteString(fmt.Sprintf("  state dir    %s\n", cfg.StateDir))
 	if cfg.MaxDuration > 0 {
 		b.WriteString(fmt.Sprintf("  time budget  %s (stops at a checkpoint; a re-run resumes)\n", cfg.MaxDuration))
+	}
+	if s.sess.resumeFrom > 0 {
+		b.WriteString(styleWarn.Render(fmt.Sprintf("  resume from  id %d (forced — overrides checkpoints)", s.sess.resumeFrom)) + "\n")
+	}
+	if s.sess.stallTimeout > 0 {
+		b.WriteString(fmt.Sprintf("  stall kill   after %s of silence\n", s.sess.stallTimeout))
+	}
+	if s.sess.ignoreLock {
+		b.WriteString(styleWarn.Render("  lock         IGNORED — concurrent runs corrupt checkpoints") + "\n")
 	}
 	b.WriteString(styleDim.Render("  a deploy or crash mid-run is fine — the supervisor resumes from the last object id\n"))
 

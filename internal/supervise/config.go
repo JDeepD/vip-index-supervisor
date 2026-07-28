@@ -54,7 +54,10 @@ type Config struct {
 	Strategy   Strategy
 	// IntoVersion is the existing version StrategyIntoVersion builds into.
 	IntoVersion int
-	ShowErrors  bool
+	// ResumeFrom forces the starting object ID, overriding checkpoints and
+	// the live resume point. Only meaningful with a single indexable.
+	ResumeFrom int64
+	ShowErrors bool
 
 	StateDir string
 

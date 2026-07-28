@@ -16,14 +16,28 @@ import (
 	"github.com/jdeepd/vip-index-supervisor/internal/tui"
 )
 
+// version is stamped by release.sh via -ldflags "-X main.version=vX.Y.Z".
+var version = "dev"
+
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version", "-v", "version":
+			fmt.Println("vip-index-supervisor " + version)
+			return
+		default:
+			fmt.Fprintln(os.Stderr,
+				"vip-index-supervisor is an interactive TUI — run it without arguments (supported: --version)")
+			os.Exit(2)
+		}
+	}
 	if !isTerminal() {
 		fmt.Fprintln(os.Stderr,
 			"vip-index-supervisor is an interactive TUI and needs a real terminal.\n"+
 				"Run it from a shell (ideally inside tmux on a persistent host).")
 		os.Exit(2)
 	}
-	program := tea.NewProgram(tui.NewApp(), tea.WithAltScreen())
+	program := tea.NewProgram(tui.NewApp(version), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

@@ -107,6 +107,10 @@ func (s *Supervisor) Run(ctx context.Context) {
 		defer lock.Release()
 	}
 
+	if removed := cleanOldAttemptLogs(filepath.Join(s.cfg.StateDir, "logs")); removed > 0 {
+		s.logf(LevelInfo, "removed %d attempt log(s) older than %d days", removed, attemptLogMaxAgeDays)
+	}
+
 	s.startedAt = time.Now()
 	if s.cfg.MaxDuration > 0 {
 		s.deadline = s.startedAt.Add(s.cfg.MaxDuration)
@@ -279,6 +283,9 @@ func (s *Supervisor) completePhase(ctx context.Context, indexable string, versio
 // and trusting it would skip every object above that ID in a brand new,
 // empty index.
 func (s *Supervisor) resolveStartCheckpoint(ctx context.Context, indexable string, version int) int64 {
+	if s.cfg.ResumeFrom > 0 {
+		return s.cfg.ResumeFrom
+	}
 	if s.cfg.Strategy == StrategySetup {
 		return 0 // fresh build starts from the top
 	}
@@ -634,6 +641,32 @@ func (s *Supervisor) closeLogs() {
 	}
 }
 
+// Attempt logs are forensic only — resume depends on checkpoint files, never
+// on logs — so old ones can be pruned freely to keep the state dir bounded.
+const attemptLogMaxAgeDays = 14
+
+func cleanOldAttemptLogs(logDir string) int {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().AddDate(0, 0, -attemptLogMaxAgeDays)
+	removed := 0
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "attempt-") || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(logDir, entry.Name())) == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
 func (s *Supervisor) attemptLogPath(indexable string) string {
 	stamp := time.Now().Format("20060102-150405")
 	return filepath.Join(s.cfg.StateDir, "logs", fmt.Sprintf("attempt-%s-%s.log", indexable, stamp))
@@ -660,6 +693,8 @@ func (s *Supervisor) logf(level Level, format string, args ...any) {
 	now := time.Now()
 
 	if s.logFile != nil {
+		// Go layout string: the reference time "2006-01-02 15:04:05-0700"
+		// rendered with the actual timestamp, i.e. YYYY-MM-DD HH:MM:SS±TZ.
 		fmt.Fprintf(s.logFile, "%s  %s\n", now.Format("2006-01-02 15:04:05-0700"), msg)
 	}
 	if s.eventsFile != nil {
