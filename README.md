@@ -13,7 +13,23 @@ container: a deploy is what kills the indexing process.
 ## Install on a remote instance
 
 The binaries are published as GitHub release assets — no runtime, no
-dependencies. On a typical remote instance (Linux x86_64):
+dependencies. The install script detects OS/arch, verifies the SHA-256
+checksum against the release, and puts the binary on PATH
+(`/usr/local/bin` if writable, else `~/.local/bin`):
+
+```
+curl -fsSL https://raw.githubusercontent.com/JDeepD/vip-index-supervisor/main/install.sh | sh
+```
+
+It is built to be pipe-safe: nothing executes until the whole script has
+arrived, a corrupted download fails the checksum and installs nothing, and
+`VERSION=v1.0.0` / `INSTALL_DIR=...` environment variables override the
+defaults. Prefer to read it first? It is [install.sh](install.sh) in the
+repository root.
+
+### Manual download
+
+On a typical remote instance (Linux x86_64):
 
 ```
 curl -fsSL -o vip-index-supervisor https://github.com/JDeepD/vip-index-supervisor/releases/latest/download/vip-index-supervisor-linux-amd64
