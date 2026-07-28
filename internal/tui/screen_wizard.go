@@ -378,7 +378,9 @@ func (s *optionsScreen) fieldRow(field int, label, value string) string {
 	if value == "" {
 		return cursor + label + "\n"
 	}
-	return fmt.Sprintf("%s%-38s %s\n", cursor, label, value)
+	// Pad by display width, not fmt's byte width: the highlighted label
+	// carries ANSI colour codes that %-38s would count as padding.
+	return cursor + padRight(label, 39) + value + "\n"
 }
 
 // -- confirm ------------------------------------------------------------------

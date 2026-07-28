@@ -114,6 +114,15 @@ func (s *Supervisor) Run(ctx context.Context) {
 	s.logf(LevelInfo, "===== supervisor start (target: %s, phases: %s, strategy: %s) =====",
 		s.cfg.Target.Label(), strings.Join(s.cfg.Indexables, ", "), s.cfg.Strategy)
 
+	if problems := s.preflight(ctx); len(problems) > 0 {
+		for _, problem := range problems {
+			s.logf(LevelError, "preflight: %s", problem)
+		}
+		s.events <- DoneEvent{ExitCode: 2, Message: "preflight failed — nothing was started"}
+		return
+	}
+	s.logf(LevelInfo, "preflight ok — every indexable is registered")
+
 	for i, indexable := range s.cfg.Indexables {
 		if s.stopRequested() {
 			break
