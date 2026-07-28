@@ -119,7 +119,13 @@ func (a *App) View() string {
 	b.WriteString(styleDim.Render(" " + a.version + "  ·  " + a.breadcrumb()))
 	b.WriteString("\n\n")
 	b.WriteString(a.top().View())
-	return styleFrame.Render(b.String())
+	frame := styleFrame.Render(b.String())
+	if uiASCII {
+		// One pass over the finished frame downgrades every glyph, engine
+		// log lines included, without any screen needing to know about it.
+		frame = asciiReplacer.Replace(frame)
+	}
+	return frame
 }
 
 func (a *App) breadcrumb() string {

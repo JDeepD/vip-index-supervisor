@@ -75,8 +75,7 @@ type versionListScreen struct {
 }
 
 func newVersionListScreen(sess *session, indexable string) *versionListScreen {
-	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
-	sp.Style = styleAccent
+	sp := newSpinner()
 	return &versionListScreen{
 		id:        screenSerial.Add(1),
 		sess:      sess,
@@ -349,8 +348,7 @@ type versionMutateScreen struct {
 }
 
 func newVersionMutateScreen(sess *session, indexable string, rows []vipsearch.IndexVersion, selected vipsearch.IndexVersion, kind mutateKind) *versionMutateScreen {
-	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
-	sp.Style = styleAccent
+	sp := newSpinner()
 	verb := "Activate"
 	if kind == mutateDelete {
 		verb = "Delete"

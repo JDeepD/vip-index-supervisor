@@ -35,8 +35,7 @@ type outputScreen struct {
 }
 
 func newOutputScreen(sess *session, action string) *outputScreen {
-	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
-	sp.Style = styleAccent
+	sp := newSpinner()
 	return &outputScreen{
 		id:      screenSerial.Add(1),
 		sess:    sess,
@@ -267,8 +266,7 @@ type unlockScreen struct {
 }
 
 func newUnlockScreen(sess *session) *unlockScreen {
-	sp := spinner.New(spinner.WithSpinner(spinner.Dot))
-	sp.Style = styleAccent
+	sp := newSpinner()
 	return &unlockScreen{
 		id:    screenSerial.Add(1),
 		sess:  sess,
