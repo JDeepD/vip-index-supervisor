@@ -18,6 +18,9 @@ var reNewVersion = regexp.MustCompile(`(?i)new index version\s+(\d+)`)
 // because a resume after a crash must target the same half-built version
 // instead of stacking up a fresh one on every attempt.
 func (s *Supervisor) resolveVersion(ctx context.Context, indexable string) (int, error) {
+	if s.cfg.Strategy == StrategyIntoVersion {
+		return s.cfg.IntoVersion, nil
+	}
 	if s.cfg.Strategy != StrategyNewVersion {
 		return 0, nil
 	}
@@ -126,9 +129,10 @@ func (s *Supervisor) activateVersion(ctx context.Context, indexable string, vers
 	s.logf(LevelOK, "[%s] verified v%d — %s", indexable, version, detail)
 	s.logf(LevelInfo, "[%s] activating index version %d", indexable, version)
 
-	res := s.client.Target.Run(ctx, 5*time.Minute,
-		"index-versions", "activate", indexable, strconv.Itoa(version), "--skip-confirm")
-	if failedActivation(res) {
+	res := s.client.ActivateVersion(ctx, indexable, version)
+	// Fail towards leaving the old index active: the worst case is a manual
+	// activation, not an empty index serving search.
+	if !res.Succeeded() {
 		s.logf(LevelError,
 			"[%s] FAILED to activate version %d; the old index is still serving search. Activate manually once resolved.",
 			indexable, version)
@@ -140,15 +144,6 @@ func (s *Supervisor) activateVersion(ctx context.Context, indexable string, vers
 	s.logf(LevelInfo, "[%s] previous version retained — remove it with: %s index-versions delete %s previous",
 		indexable, s.commandHint(), indexable)
 	return true
-}
-
-var reErrorLine = regexp.MustCompile(`(?m)^\s*Error:`)
-
-func failedActivation(res vipsearch.RunResult) bool {
-	if res.NotFound || res.TimedOut || len(res.Output) == 0 {
-		return true
-	}
-	return reErrorLine.MatchString(res.Output)
 }
 
 func (s *Supervisor) commandHint() string {

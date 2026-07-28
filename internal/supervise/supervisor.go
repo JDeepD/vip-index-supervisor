@@ -234,8 +234,15 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 }
 
 func (s *Supervisor) completePhase(ctx context.Context, indexable string, version int, outcome attemptOutcome) bool {
-	if version > 0 && !s.activateVersion(ctx, indexable, version) {
-		return false
+	switch {
+	case s.cfg.Strategy == StrategyNewVersion:
+		if !s.activateVersion(ctx, indexable, version) {
+			return false
+		}
+	case s.cfg.Strategy == StrategyIntoVersion:
+		// Building into an existing version never auto-activates: the user
+		// chose that version deliberately and decides when it serves search.
+		s.logf(LevelOK, "[%s] version %d built — activate it from the versions screen when ready", indexable, version)
 	}
 	s.store.ClearCheckpoint(indexable, version)
 
@@ -267,7 +274,7 @@ func (s *Supervisor) resolveStartCheckpoint(ctx context.Context, indexable strin
 		return 0 // fresh build starts from the top
 	}
 	local := s.store.ReadCheckpoint(indexable, version)
-	if s.cfg.Strategy == StrategyNewVersion {
+	if s.cfg.Strategy == StrategyNewVersion || s.cfg.Strategy == StrategyIntoVersion {
 		return local
 	}
 	if indexable != "post" {

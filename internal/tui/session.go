@@ -18,6 +18,7 @@ type session struct {
 	indexables  []string
 	postTypes   string
 	strategy    supervise.Strategy
+	intoVersion int // set when strategy is StrategyIntoVersion
 	perPage     int
 	showErrors  bool
 	maxDuration time.Duration
@@ -36,6 +37,7 @@ func (s *session) config() supervise.Config {
 		PostTypes:   s.postTypes,
 		PerPage:     s.perPage,
 		Strategy:    s.strategy,
+		IntoVersion: s.intoVersion,
 		ShowErrors:  s.showErrors,
 		MaxDuration: s.maxDuration,
 	}
@@ -63,6 +65,8 @@ func (s *session) previewCommand(indexable string) string {
 		parts = append(parts, "--setup")
 	case supervise.StrategyNewVersion:
 		parts = append(parts, "--version=<new>")
+	case supervise.StrategyIntoVersion:
+		parts = append(parts, "--version="+strconv.Itoa(s.intoVersion))
 	}
 	return strings.Join(parts, " ")
 }

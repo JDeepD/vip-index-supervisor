@@ -103,7 +103,7 @@ func newActionScreen(sess *session) *actionScreen {
 		{Value: "watch", Label: "watch", Desc: "poll status until indexing goes idle"},
 		{Value: "health", Label: "health", Desc: "is the active index populated? do counts align?"},
 		{Value: "counts", Label: "counts", Desc: "DB vs ES document counts (slow)"},
-		{Value: "versions", Label: "versions", Desc: "list index versions"},
+		{Value: "versions", Label: "versions", Desc: "browse versions: activate, delete, or build into one"},
 		{Value: "unlock", Label: "unlock", Desc: "clear a stale index lock (delete-transient)"},
 		{Value: "stop", Label: "stop", Desc: "ask a running index to stop"},
 	})}
@@ -126,6 +126,8 @@ func (s *actionScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	switch s.menu.Selected().Value {
 	case "index":
 		return s, push(newIndexablesScreen(s.sess))
+	case "versions":
+		return s, push(newVersionsIndexableScreen(s.sess))
 	case "watch":
 		return s, push(newWatchScreen(s.sess))
 	case "unlock":
@@ -172,7 +174,9 @@ func (s *indexablesScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	}
 	s.sess.indexables = s.multi.Selected()
 	if contains(s.sess.indexables, "post") {
-		return s, push(newPostTypesScreen(s.sess))
+		return s, push(newPostTypesScreen(s.sess, func(sess *session) Screen {
+			return newStrategyScreen(sess)
+		}))
 	}
 	return s, push(newStrategyScreen(s.sess))
 }
@@ -184,12 +188,15 @@ func (s *indexablesScreen) View() string {
 		styleHelp.Render("↑/↓ move · space toggle · a all · enter continue · esc back")
 }
 
-func newPostTypesScreen(sess *session) *inputScreen {
+// newPostTypesScreen takes its successor as a parameter because two wizards
+// pass through it: the normal index flow (next: strategy) and the
+// build-into-version flow (next: options — the strategy is already fixed).
+func newPostTypesScreen(sess *session, next func(*session) Screen) *inputScreen {
 	in := newInputScreen("post types", "Restrict to specific post types?",
 		"comma-separated, e.g. post,page — empty indexes every post type", sess.postTypes)
 	in.submit = func(v string) tea.Cmd {
 		sess.postTypes = v
-		return push(newStrategyScreen(sess))
+		return push(next(sess))
 	}
 	return in
 }
@@ -223,6 +230,9 @@ func (s *strategyScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	if !s.menu.Update(key) {
 		return s, nil
 	}
+	// A leftover version pin from an earlier "build into version" trip through
+	// this session must not leak into a freshly chosen strategy.
+	s.sess.intoVersion = 0
 	switch s.menu.Selected().Value {
 	case "new-version":
 		s.sess.strategy = supervise.StrategyNewVersion

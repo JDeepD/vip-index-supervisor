@@ -232,6 +232,31 @@ func (c *Client) ValidateCounts(ctx context.Context, postsOnly bool) CountReport
 	return report
 }
 
+// ActivateVersion makes an index version the one serving search. Irreversible
+// in effect (the previous version stops serving immediately), so callers must
+// confirm with the user first.
+func (c *Client) ActivateVersion(ctx context.Context, indexable string, version int) RunResult {
+	return c.run(ctx, 5*time.Minute,
+		"index-versions", "activate", indexable, strconv.Itoa(version), "--skip-confirm")
+}
+
+// DeleteVersion permanently removes an index version and its documents.
+func (c *Client) DeleteVersion(ctx context.Context, indexable string, version int) RunResult {
+	return c.run(ctx, 5*time.Minute,
+		"index-versions", "delete", indexable, strconv.Itoa(version), "--skip-confirm")
+}
+
+// Succeeded reports whether a mutating command actually worked: silence or an
+// Error-framed line both mean it did not.
+func (r RunResult) Succeeded() bool {
+	if r.NotFound || r.TimedOut || strings.TrimSpace(r.Output) == "" {
+		return false
+	}
+	return !reErrorFramedLine.MatchString(r.Output)
+}
+
+var reErrorFramedLine = regexp.MustCompile(`(?m)^\s*Error:`)
+
 // ClearIndexLock clears the stale "an index is already occurring" transient.
 func (c *Client) ClearIndexLock(ctx context.Context) RunResult {
 	return c.run(ctx, 2*time.Minute, "delete-transient")

@@ -85,8 +85,6 @@ func (s *outputScreen) fetch() tea.Cmd {
 			text = renderHealth(ctx, client)
 		case "counts":
 			text = renderCounts(client.ValidateCounts(ctx, false))
-		case "versions":
-			text = renderVersions(client, ctx, []string{"post", "term", "user", "comment"})
 		case "stop":
 			res := client.StopIndexing(ctx)
 			text = strings.TrimSpace(res.Output)

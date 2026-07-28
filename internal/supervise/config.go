@@ -25,6 +25,10 @@ const (
 	// StrategySetup drops and rebuilds the live index in place; search
 	// returns nothing until the rebuild finishes.
 	StrategySetup
+	// StrategyIntoVersion builds into an existing, already-registered version
+	// (Config.IntoVersion). Nothing is created and nothing is activated —
+	// activation stays a deliberate, separate step.
+	StrategyIntoVersion
 )
 
 func (s Strategy) String() string {
@@ -33,6 +37,8 @@ func (s Strategy) String() string {
 		return "new version"
 	case StrategySetup:
 		return "rebuild in place"
+	case StrategyIntoVersion:
+		return "into existing version"
 	default:
 		return "resume in place"
 	}
@@ -46,7 +52,9 @@ type Config struct {
 	PostTypes  string // comma-separated, post indexable only
 	PerPage    int
 	Strategy   Strategy
-	ShowErrors bool
+	// IntoVersion is the existing version StrategyIntoVersion builds into.
+	IntoVersion int
+	ShowErrors  bool
 
 	StateDir string
 

@@ -51,7 +51,7 @@ Then an action:
 | watch    | poll status until indexing goes idle                 |
 | health   | is the active index populated? do counts align?      |
 | counts   | DB vs ES document counts                             |
-| versions | list index versions and document counts              |
+| versions | browse versions: activate, delete, or build into one |
 | unlock   | clear a stale index lock (delete-transient)          |
 | stop     | ask a running index to stop                          |
 
@@ -75,6 +75,29 @@ picking the resume point from the local checkpoint and the platform's own
 returns nothing until the rebuild finishes. Against a production-looking
 environment the TUI requires typing the environment name to confirm, because
 every command carries `--skip-confirm` and nothing downstream will stop you.
+
+## Managing index versions
+
+The `versions` action is interactive: pick an indexable, arrow over its
+versions, and press enter on one to act on it.
+
+- **Activate** (inactive versions only) — makes that version serve search.
+  The confirmation shows its document count against the currently active
+  index and warns before anything runs: an empty version, a version holding
+  under 90% of the active one's documents, or an older version (a rollback)
+  are all flagged. Against a production-looking environment you must type the
+  environment name to confirm.
+- **Delete** (inactive versions only) — permanently removes the version and
+  its documents, behind the same confirmation and production guard. The
+  active version can never be deleted from here.
+- **Build into** — runs supervised indexing *into* that existing version
+  (`--version=N`), with all the usual resume/checkpoint behaviour, but never
+  creates or activates anything: when the build completes, the tool tells you
+  to activate it from the versions screen once you are satisfied. This is how
+  you finish a half-built version whose earlier run refused activation.
+
+After an activate or delete, the list refreshes so the new state is visible
+immediately.
 
 ## How resuming works
 
