@@ -26,6 +26,11 @@ type ctrlCOwner interface{ OwnsCtrlC() bool }
 // sizable is a Screen that adapts to the terminal size.
 type sizable interface{ SetSize(width, height int) }
 
+// resumable is a Screen that wants to run a command whenever it becomes the
+// top of the stack again — e.g. a listing that must refetch because a screen
+// above it may have changed what it displays.
+type resumable interface{ Resumed() tea.Cmd }
+
 // pushMsg and popMsg are how screens navigate. Only the root App touches the
 // stack, so no screen can corrupt another's state.
 type pushMsg struct{ screen Screen }
@@ -71,6 +76,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case popMsg:
 		if len(a.stack) > 1 {
 			a.stack = a.stack[:len(a.stack)-1]
+		}
+		if r, ok := a.top().(resumable); ok {
+			return a, r.Resumed()
 		}
 		return a, nil
 

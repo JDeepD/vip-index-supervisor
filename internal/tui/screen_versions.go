@@ -63,10 +63,6 @@ type versionsLoadedMsg struct {
 	failure []string
 }
 
-// versionsRefreshMsg asks the list to refetch; sent after a mutation so the
-// user immediately sees the new state.
-type versionsRefreshMsg struct{}
-
 type versionListScreen struct {
 	id        int64
 	sess      *session
@@ -96,6 +92,16 @@ func (s *versionListScreen) Init() tea.Cmd {
 	return tea.Batch(s.spin.Tick, s.fetch())
 }
 
+// Resumed refetches whenever this screen surfaces again: a screen above it
+// may have activated or deleted a version, and showing yesterday's list next
+// to a "deleted ✓" the user just saw is worse than a brief spinner.
+func (s *versionListScreen) Resumed() tea.Cmd {
+	if s.loading {
+		return nil
+	}
+	return tea.Batch(s.spin.Tick, s.fetch())
+}
+
 func (s *versionListScreen) fetch() tea.Cmd {
 	s.loading = true
 	id, sess, indexable := s.id, s.sess, s.indexable
@@ -122,8 +128,6 @@ func (s *versionListScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			s.cursor = max(0, len(s.rows)-1)
 		}
 		return s, nil
-	case versionsRefreshMsg:
-		return s, tea.Batch(s.spin.Tick, s.fetch())
 	case spinner.TickMsg:
 		if !s.loading {
 			return s, nil
@@ -380,9 +384,12 @@ func (s *versionMutateScreen) Title() string {
 
 func (s *versionMutateScreen) Init() tea.Cmd { return nil }
 
-// OwnsEsc while running: the command is already in flight; Esc must not
-// abandon the screen that will report its outcome.
-func (s *versionMutateScreen) OwnsEsc() bool { return s.stage == "running" || s.stage == "guard" }
+// OwnsEsc everywhere except the initial confirm: while running, Esc must not
+// abandon the screen that will report the outcome; in the guard it cancels
+// back to confirm; and after completion it must take the same
+// back-past-the-stale-action-menu route as enter — a plain single pop would
+// resurface an action menu for a version that may no longer exist.
+func (s *versionMutateScreen) OwnsEsc() bool { return s.stage != "confirm" }
 
 func (s *versionMutateScreen) execute() tea.Cmd {
 	s.stage = "running"
@@ -469,9 +476,9 @@ func (s *versionMutateScreen) handleKey(key tea.KeyMsg) (Screen, tea.Cmd) {
 		case "q":
 			return s, tea.Quit
 		case "enter", "esc":
-			// Back to the list (two screens up), then refresh it so the user
-			// sees the new state immediately.
-			return s, tea.Sequence(pop(), pop(), func() tea.Msg { return versionsRefreshMsg{} })
+			// Back to the list, past the action menu whose version row is now
+			// stale; the list refetches itself on resurfacing (Resumed).
+			return s, tea.Sequence(pop(), pop())
 		}
 	}
 	return s, nil
