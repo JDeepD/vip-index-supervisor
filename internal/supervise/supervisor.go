@@ -36,6 +36,12 @@ type Supervisor struct {
 	startedAt  time.Time
 	deadline   time.Time
 
+	// Per-attempt counters from the child, which restarts counting at every
+	// attempt. The phase-level Done/Total shown to the UI are derived from
+	// these so the progress bar never falls back to 0% on a resume.
+	attemptDone  int64
+	attemptTotal int64
+
 	logFile    *os.File
 	eventsFile *os.File
 }
@@ -472,12 +478,26 @@ func (s *Supervisor) applyProgress(indexable string, version int, p vipsearch.Pr
 	s.mu.Lock()
 	ph := &s.phases[s.current]
 	if p.Total != vipsearch.NoValue {
-		ph.Total = p.Total
+		s.attemptTotal = p.Total
+		// The first attempt's total is the whole phase; later attempts
+		// report only what REMAINS, so the largest total seen is the size
+		// of the phase this run started with.
+		ph.Total = max(ph.Total, p.Total)
 	}
 	if p.Done != vipsearch.NoValue {
-		ph.Done = p.Done
-		s.samples = append(s.samples, rateSample{at: time.Now(), done: p.Done})
-		s.trimSamplesLocked()
+		s.attemptDone = p.Done
+	}
+	if s.attemptTotal > 0 && s.attemptDone >= 0 && ph.Total > 0 {
+		// Overall done = phase size minus what the current attempt still has
+		// left. Restart-proof: a resumed attempt's smaller total and reset
+		// counter cancel out. Clamped monotonic so corpus drift mid-run can
+		// never walk the bar backwards.
+		overall := ph.Total - (s.attemptTotal - s.attemptDone)
+		if overall > ph.Done {
+			ph.Done = overall
+			s.samples = append(s.samples, rateSample{at: time.Now(), done: overall})
+			s.trimSamplesLocked()
+		}
 	}
 	checkpointID := int64(0)
 	if p.LastObjectID != vipsearch.NoValue {
@@ -503,6 +523,8 @@ func (s *Supervisor) beginPhase(i int) {
 	s.mu.Lock()
 	s.current = i
 	s.samples = nil
+	s.attemptDone = vipsearch.NoValue
+	s.attemptTotal = vipsearch.NoValue
 	p := &s.phases[i]
 	p.Status = PhaseRunning
 	p.StatusNote = "starting"
