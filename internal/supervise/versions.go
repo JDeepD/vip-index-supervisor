@@ -41,10 +41,19 @@ func (s *Supervisor) createVersion(ctx context.Context, indexable string) (int, 
 	if m := reNewVersion.FindStringSubmatch(res.Output); m != nil {
 		version, _ = strconv.Atoi(m[1])
 	} else {
+		// VIP allows at most two versions per indexable, so at the limit
+		// `add` fails. Falling back to the inactive slot keeps the rebuild
+		// possible — but it REPLACES that version's contents, which deserves
+		// saying out loud rather than a silently surprising version number.
 		for _, v := range s.client.Versions(ctx, indexable) {
 			if !v.Active && v.Number > version {
 				version = v.Number
 			}
+		}
+		if version > 0 {
+			s.logf(LevelWarn,
+				"[%s] could not register a new version (VIP allows two per indexable) — reusing inactive v%d; its previous contents will be replaced",
+				indexable, version)
 		}
 	}
 	if version == 0 {

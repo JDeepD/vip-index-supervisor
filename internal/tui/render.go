@@ -73,21 +73,21 @@ func renderStatusUnavailable(client *vipsearch.Client) string {
 	return b.String()
 }
 
-func renderVersions(client *vipsearch.Client, ctx context.Context, indexables []string) string {
+// renderAllVersions renders one combined version table covering every
+// indexable that is actually registered, and a single dim note for the rest
+// — an inactive feature is normal, not an error worth six lines each.
+func renderAllVersions(ctx context.Context, client *vipsearch.Client) string {
 	var b strings.Builder
-	for _, indexable := range indexables {
-		b.WriteString(styleHeading.Render("Index versions — "+indexable) + "\n")
+	b.WriteString(styleHeading.Render("Index versions") + "\n")
+	b.WriteString(styleDim.Render("  "+padRight("indexable", 11)+padRight("version", 9)+padRight("state", 10)+padLeft("documents", 15)) + "\n")
+
+	var unavailable []string
+	for _, indexable := range []string{"post", "term", "user", "comment"} {
 		rows := client.Versions(ctx, indexable)
 		if len(rows) == 0 {
-			// `index-versions list` always reports at least version 1, so an
-			// empty result means the command failed — show its own words.
-			b.WriteString(styleWarn.Render("  (none parsed)") + "\n")
-			for _, line := range client.LastRun.DescribeFailure() {
-				b.WriteString(styleDim.Render("    "+line) + "\n")
-			}
+			unavailable = append(unavailable, indexable)
 			continue
 		}
-		b.WriteString(styleDim.Render(fmt.Sprintf("  %-8s %-10s %14s", "version", "state", "documents")) + "\n")
 		for _, v := range rows {
 			state := styleDim.Render("—")
 			if v.Active {
@@ -97,8 +97,12 @@ func renderVersions(client *vipsearch.Client, ctx context.Context, indexables []
 			if v.Active && v.Documents == 0 {
 				docs = styleErr.Render(docs + "  ⚠ EMPTY")
 			}
-			b.WriteString("  " + padRight(strconv.Itoa(v.Number), 9) + padRight(state, 10) + padLeft(docs, 15) + "\n")
+			b.WriteString("  " + padRight(indexable, 11) + padRight(fmt.Sprintf("v%d", v.Number), 9) +
+				padRight(state, 10) + padLeft(docs, 15) + "\n")
 		}
+	}
+	if len(unavailable) > 0 {
+		b.WriteString(styleDim.Render("  not registered (feature inactive?): "+strings.Join(unavailable, ", ")) + "\n")
 	}
 	return b.String()
 }
@@ -163,19 +167,28 @@ func renderHealth(ctx context.Context, client *vipsearch.Client) string {
 		b.WriteString("  indexing      idle\n")
 	}
 
-	versions := client.Versions(ctx, "post")
-	if active := vipsearch.ActiveVersion(versions); active != nil {
-		line := fmt.Sprintf("  active index  v%d — %s documents", active.Number, groupInt(active.Documents))
-		if active.Documents == 0 {
-			b.WriteString(styleErr.Render(line) + "\n")
-			b.WriteString(styleErr.Render("  ⚠ active index is EMPTY — search will return nothing") + "\n")
-		} else {
-			b.WriteString(styleOK.Render(line) + "\n")
+	b.WriteString("  active indexes\n")
+	var unavailable []string
+	for _, indexable := range []string{"post", "term", "user", "comment"} {
+		rows := client.Versions(ctx, indexable)
+		if len(rows) == 0 {
+			unavailable = append(unavailable, indexable)
+			continue
 		}
-	} else if len(versions) == 0 {
-		b.WriteString(styleErr.Render("  active index  could not read the version list") + "\n")
-	} else {
-		b.WriteString(styleWarn.Render("  active index  none of the reported versions is active") + "\n")
+		active := vipsearch.ActiveVersion(rows)
+		switch {
+		case active == nil:
+			b.WriteString(styleWarn.Render("    "+padRight(indexable, 10)+"none of the reported versions is active") + "\n")
+		case active.Documents == 0:
+			b.WriteString(styleErr.Render(fmt.Sprintf("    %sv%d — EMPTY, search returns nothing for %s",
+				padRight(indexable, 10), active.Number, indexable)) + "\n")
+		default:
+			b.WriteString(styleOK.Render(fmt.Sprintf("    %sv%d — %s documents",
+				padRight(indexable, 10), active.Number, groupInt(active.Documents))) + "\n")
+		}
+	}
+	if len(unavailable) > 0 {
+		b.WriteString(styleDim.Render("    not registered (feature inactive?): "+strings.Join(unavailable, ", ")) + "\n")
 	}
 
 	b.WriteString("\n" + renderCounts(client.ValidateCounts(ctx, false)))
@@ -189,7 +202,7 @@ func renderInfo(ctx context.Context, client *vipsearch.Client) string {
 	if !client.Target.IsVIP() {
 		b.WriteString(styleDim.Render("  via "+strings.Join(client.Target.Base(), " ")+" (direct, not VIP-CLI)") + "\n")
 	}
-	b.WriteString("\n" + renderVersions(client, ctx, []string{"post"}) + "\n")
+	b.WriteString("\n" + renderAllVersions(ctx, client) + "\n")
 
 	if st := client.Status(ctx); st != nil {
 		b.WriteString(renderStatus(st))
