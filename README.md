@@ -214,7 +214,8 @@ file lock, released by the kernel if the holder dies, so it cannot go stale.
 
 | situation                                   | response                                            |
 |---------------------------------------------|-----------------------------------------------------|
-| stale lock (`An index is already occurring`)| `delete-transient`, then retry (not a failed attempt) |
+| stale lock (`An index is already occurring`)| `delete-transient`, then retry with exponential backoff (not a failed attempt) |
+| lock that will not clear                    | after 5 tries, probe the blocking sync: a **frozen** one (no movement in 15s) is cleared with `stop-indexing`; a **live** one aborts the run with a diagnosis, untouched |
 | process died, progress was made             | resume from the checkpoint, reset backoff           |
 | process died, no progress                   | exponential backoff, abort after 5 fruitless tries  |
 | no output for 10 minutes                    | kill the process tree and retry                     |

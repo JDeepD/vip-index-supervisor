@@ -33,6 +33,11 @@ func renderStatus(st *vipsearch.IndexingStatus) string {
 		indexable = "—"
 	}
 	b.WriteString("  indexable      " + styleAccent.Render(indexable) + "\n")
+	if st.Method != "" {
+		// cli = someone's wp command; dashboard/cron = the platform's own
+		// background sync — the thing to check when a lock will not clear.
+		b.WriteString("  started via    " + st.Method + "\n")
+	}
 
 	total := firstPositive(cur.Total, st.TotalItems)
 	synced := firstNonNegative(cur.Synced, st.ItemsIndexed)

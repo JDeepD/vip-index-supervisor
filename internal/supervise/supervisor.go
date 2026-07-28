@@ -175,6 +175,8 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 	}
 
 	noProgress := 0
+	lockErrors := 0
+	clearedStuckSync := false
 	backoff := s.cfg.BackoffBase
 
 	for !s.stopRequested() {
@@ -216,14 +218,36 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 		s.updatePhase(func(p *PhaseSnapshot) { p.Restarts++ })
 
 		if outcome.lockError {
-			s.setStatusNote("clearing stale index lock")
-			s.logf(LevelWarn, "[%s] stale index lock — clearing (delete-transient)", indexable)
-			s.client.ClearIndexLock(ctx)
-			if !s.sleep(ctx, s.cfg.BackoffBase) {
+			lockErrors++
+			if lockErrors >= maxConsecutiveLockErrors {
+				// delete-transient only clears the CLI lock. A dead
+				// dashboard/cron sync blocks indexing from a different place
+				// (its own sync state), which needs stop-indexing — but only
+				// once, and only if the blocking sync is provably frozen.
+				if !clearedStuckSync && s.clearStuckSyncIfFrozen(ctx, indexable) {
+					clearedStuckSync = true
+					lockErrors = 0
+					if !s.sleep(ctx, s.cfg.BackoffBase) {
+						return false
+					}
+					continue
+				}
+				s.reportPersistentLock(ctx, indexable, clearedStuckSync)
 				return false
 			}
+			s.setStatusNote("clearing stale index lock")
+			s.logf(LevelWarn, "[%s] stale index lock — clearing (delete-transient), retrying in %s", indexable, backoff)
+			s.client.ClearIndexLock(ctx)
+			if !s.sleep(ctx, backoff) {
+				return false
+			}
+			// Escalate like every other retry: a lock that needs clearing
+			// twice in a row deserves a longer look, not a 5s hammer that
+			// floods the audit log with delete-transient calls.
+			backoff = min(backoff*2, s.cfg.BackoffMax)
 			continue // a stale lock is not a failed attempt
 		}
+		lockErrors = 0
 
 		after := s.lastObjectID()
 		progressed := after != vipsearch.NoValue && (before == vipsearch.NoValue || after < before)
@@ -281,6 +305,87 @@ func (s *Supervisor) completePhase(ctx context.Context, indexable string, versio
 		indexable, formatInt(indexed), elapsed.Round(time.Second), attempts)
 	s.emitProgress()
 	return true
+}
+
+// A stale lock clears on the first try. One that survives several
+// clear-and-retry rounds is held from elsewhere: either a live indexing
+// process re-asserting it, or a dead sync whose bookkeeping still says
+// "running" — the two need opposite responses, so they must be told apart.
+const maxConsecutiveLockErrors = 5
+
+// syncFreezeProbeDelay is how long the two status reads are apart. A live
+// bulk sync advances thousands of objects in this window; identical numbers
+// mean the recorded sync is dead.
+const syncFreezeProbeDelay = 15 * time.Second
+
+// clearStuckSyncIfFrozen checks whether the sync blocking this phase is
+// actually advancing. If it is provably frozen, its stuck state is cleared
+// (stop-indexing + delete-transient) and true is returned so the phase can
+// retry. A live sync is never touched.
+func (s *Supervisor) clearStuckSyncIfFrozen(ctx context.Context, indexable string) bool {
+	first := s.client.Status(ctx)
+	if first == nil || !first.Indexing {
+		return false
+	}
+	s.setStatusNote("blocking sync found — probing whether it is alive")
+	s.logf(LevelInfo, "[%s] a %s sync reports in-progress — re-reading status in %s to see if it is advancing",
+		indexable, syncMethod(first), syncFreezeProbeDelay)
+	if !s.sleep(ctx, syncFreezeProbeDelay) {
+		return false
+	}
+	second := s.client.Status(ctx)
+	if second == nil {
+		return false
+	}
+	if !second.Indexing {
+		return false // it finished on its own; a plain retry will do
+	}
+	if syncFingerprint(first) != syncFingerprint(second) {
+		return false // advancing — genuinely active, do not interfere
+	}
+	s.logf(LevelWarn,
+		"[%s] the blocking %s sync is FROZEN (no movement in %s, stuck at %s) — clearing its stuck state (stop-indexing + delete-transient)",
+		indexable, syncMethod(second), syncFreezeProbeDelay, syncFingerprint(second))
+	s.client.StopIndexing(ctx)
+	s.client.ClearIndexLock(ctx)
+	return true
+}
+
+func (s *Supervisor) reportPersistentLock(ctx context.Context, indexable string, alreadyCleared bool) {
+	st := s.client.Status(ctx)
+	switch {
+	case st != nil && st.Indexing && alreadyCleared:
+		s.logf(LevelError,
+			"[%s] still locked even after clearing a frozen sync — investigate on the platform side (%s get-indexing-status), then re-run.",
+			indexable, s.commandHint())
+	case st != nil && st.Indexing:
+		s.logf(LevelError,
+			"[%s] the index lock persists and the platform reports an ACTIVE, advancing index — something else is indexing (a dashboard/cron sync or another CLI). Stop it (`stop` action / %s stop-indexing) or let it finish, then re-run.",
+			indexable, s.commandHint())
+	case st != nil:
+		s.logf(LevelError,
+			"[%s] the index lock keeps reappearing even though status reports idle — clear it manually (`unlock` action) and investigate before re-running.",
+			indexable)
+	default:
+		s.logf(LevelError,
+			"[%s] the index lock persists and the indexing status could not be read — investigate on the platform side, then re-run.",
+			indexable)
+	}
+}
+
+func syncFingerprint(st *vipsearch.IndexingStatus) string {
+	var synced, lastID int64
+	if st.CurrentSync != nil {
+		synced, lastID = st.CurrentSync.Synced, st.CurrentSync.LastObjectID
+	}
+	return fmt.Sprintf("synced %s, last id %s", formatInt(max(synced, st.ItemsIndexed)), formatInt(lastID))
+}
+
+func syncMethod(st *vipsearch.IndexingStatus) string {
+	if st.Method == "" {
+		return "background"
+	}
+	return st.Method
 }
 
 // resolveStartCheckpoint picks where indexing resumes from. When building
