@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -54,10 +53,12 @@ func (s *targetScreen) View() string {
 		styleHelp.Render("↑/↓ move · enter select · q quit")
 }
 
+// The environment always starts empty — no prefill from anywhere. A carried-
+// over production value silently becoming the default is exactly how a local
+// test ends up pointed at a live index.
 func newEnvInputScreen() *inputScreen {
 	in := newInputScreen("environment", "Which environment?",
-		"e.g. @example-app.production — from `vip app list`. Also reads $VIP_APP_ENV.",
-		os.Getenv("VIP_APP_ENV"))
+		"e.g. @example-app.production — from `vip app list`", "")
 	in.validate = func(v string) string {
 		if v == "" {
 			return "an environment is required — this tool will not guess where to index"
