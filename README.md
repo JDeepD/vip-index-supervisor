@@ -85,6 +85,18 @@ The asset names above are what the install commands expect. Publish them
 gh release create v1.0.0 dist/* --title v1.0.0
 ```
 
+Or let CI do all of it — pushing a version tag triggers
+`.github/workflows/release.yml`, which builds every platform from the tagged
+commit, stamps the version, and publishes the release with checksums:
+
+```
+git tag v1.0.2
+git push origin v1.0.2
+```
+
+`./release.sh v1.0.2` remains the manual/local path; `--dry-run` builds
+without publishing.
+
 ## Use
 
 Just run the binary — everything is interactive:
