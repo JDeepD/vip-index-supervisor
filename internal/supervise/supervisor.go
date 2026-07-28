@@ -224,13 +224,19 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 				// dashboard/cron sync blocks indexing from a different place
 				// (its own sync state), which needs stop-indexing — but only
 				// once, and only if the blocking sync is provably frozen.
-				if !clearedStuckSync && s.clearStuckSyncIfFrozen(ctx, indexable) {
-					clearedStuckSync = true
-					lockErrors = 0
-					if !s.sleep(ctx, s.cfg.BackoffBase) {
-						return false
+				if !clearedStuckSync {
+					cleared, diagnosed := s.clearStuckSyncIfFrozen(ctx, indexable)
+					if cleared {
+						clearedStuckSync = true
+						lockErrors = 0
+						if !s.sleep(ctx, s.cfg.BackoffBase) {
+							return false
+						}
+						continue
 					}
-					continue
+					if diagnosed {
+						return false // the failure was already explained
+					}
 				}
 				s.reportPersistentLock(ctx, indexable, clearedStuckSync)
 				return false
@@ -307,11 +313,12 @@ func (s *Supervisor) completePhase(ctx context.Context, indexable string, versio
 	return true
 }
 
-// A stale lock clears on the first try. One that survives several
-// clear-and-retry rounds is held from elsewhere: either a live indexing
-// process re-asserting it, or a dead sync whose bookkeeping still says
-// "running" — the two need opposite responses, so they must be told apart.
-const maxConsecutiveLockErrors = 5
+// A genuinely stale lock clears on the first delete-transient. If the second
+// attempt is refused too, the block is coming from somewhere the lock has no
+// power over: either a live sync re-asserting it, or a dead run's orphaned
+// sync record. Those need opposite responses, so probe rather than keep
+// hammering delete-transient.
+const maxConsecutiveLockErrors = 3
 
 // syncFreezeProbeDelay is how long the two status reads are apart. A live
 // bulk sync advances thousands of objects in this window; identical numbers
@@ -319,36 +326,65 @@ const maxConsecutiveLockErrors = 5
 const syncFreezeProbeDelay = 15 * time.Second
 
 // clearStuckSyncIfFrozen checks whether the sync blocking this phase is
-// actually advancing. If it is provably frozen, its stuck state is cleared
-// (stop-indexing + delete-transient) and true is returned so the phase can
-// retry. A live sync is never touched.
-func (s *Supervisor) clearStuckSyncIfFrozen(ctx context.Context, indexable string) bool {
+// actually advancing. A provably frozen one is the debris of a killed run and
+// gets cleared so the phase can retry; a live one is never touched.
+//
+// cleared says the block is gone; diagnosed says the situation was already
+// explained to the user, so the caller must not add a second, vaguer verdict.
+func (s *Supervisor) clearStuckSyncIfFrozen(ctx context.Context, indexable string) (cleared, diagnosed bool) {
 	first := s.client.Status(ctx)
 	if first == nil || !first.Indexing {
-		return false
+		return false, false
 	}
 	s.setStatusNote("blocking sync found — probing whether it is alive")
 	s.logf(LevelInfo, "[%s] a %s sync reports in-progress — re-reading status in %s to see if it is advancing",
 		indexable, syncMethod(first), syncFreezeProbeDelay)
 	if !s.sleep(ctx, syncFreezeProbeDelay) {
-		return false
+		return false, false
 	}
 	second := s.client.Status(ctx)
 	if second == nil {
-		return false
+		return false, false
 	}
 	if !second.Indexing {
-		return false // it finished on its own; a plain retry will do
+		return false, false // it finished on its own; a plain retry will do
 	}
 	if syncFingerprint(first) != syncFingerprint(second) {
-		return false // advancing — genuinely active, do not interfere
+		return false, false // advancing — genuinely active, do not interfere
 	}
 	s.logf(LevelWarn,
-		"[%s] the blocking %s sync is FROZEN (no movement in %s, stuck at %s) — clearing its stuck state (stop-indexing + delete-transient)",
+		"[%s] the blocking %s sync is FROZEN (no movement in %s, stuck at %s) — it is the debris of a killed run; clearing its sync record",
 		indexable, syncMethod(second), syncFreezeProbeDelay, syncFingerprint(second))
-	s.client.StopIndexing(ctx)
+	return s.clearOrphanedSync(ctx, indexable), true
+}
+
+// clearOrphanedSync removes a dead run's sync-state record and verifies the
+// platform now reports idle. stop-indexing is deliberately NOT used: it only
+// raises an interrupt flag for a live process to act on, so against a dead
+// sync it reports success and changes nothing.
+func (s *Supervisor) clearOrphanedSync(ctx context.Context, indexable string) bool {
+	s.logf(LevelWarn, "[%s] clearing the killed run's leftovers (ep_wpcli_sync transient + ep_index_meta record, regular and network)", indexable)
+	res := s.client.ClearSyncRecord(ctx)
 	s.client.ClearIndexLock(ctx)
-	return true
+
+	// Trust nothing: re-read the status rather than assume the delete worked.
+	if st := s.client.Status(ctx); st != nil && !st.Indexing {
+		s.logf(LevelOK, "[%s] sync record cleared — the platform now reports idle", indexable)
+		return true
+	}
+	for _, line := range res.DescribeFailure() {
+		s.logf(LevelWarn, "[%s] cleanup: %s", indexable, line)
+	}
+	wp := strings.Join(s.cfg.Target.BaseWP(), " ")
+	s.logf(LevelError,
+		"[%s] could not clear the killed run's leftovers automatically. Clear them by hand, then re-run:\n"+
+			"      %s transient delete ep_wpcli_sync\n"+
+			"      %s option delete ep_index_meta\n"+
+			"      %s site option delete ep_index_meta\n"+
+			"      %s cache delete alloptions options\n"+
+			"      %s cache delete ep_index_meta options",
+		indexable, wp, wp, wp, wp, wp)
+	return false
 }
 
 func (s *Supervisor) reportPersistentLock(ctx context.Context, indexable string, alreadyCleared bool) {

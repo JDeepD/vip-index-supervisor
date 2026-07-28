@@ -37,16 +37,26 @@ func (t Target) Label() string {
 	return "local"
 }
 
-// Base is the command prefix every vip-search invocation starts from.
-func (t Target) Base() []string {
+// BaseWP is the command prefix for any wp-cli command on this target.
+func (t Target) BaseWP() []string {
 	if t.IsVIP() {
-		return []string{"vip", t.AppEnv, "--yes", "--", "wp", "vip-search"}
+		return []string{"vip", t.AppEnv, "--yes", "--", "wp"}
 	}
 	wp := strings.Fields(t.WPCommand)
 	if len(wp) == 0 {
 		wp = []string{"wp"}
 	}
-	return append(wp, "vip-search")
+	return wp
+}
+
+// Base is the command prefix every vip-search invocation starts from.
+func (t Target) Base() []string {
+	return append(t.BaseWP(), "vip-search")
+}
+
+// RunWP executes a wp-cli command that is NOT a vip-search subcommand.
+func (t Target) RunWP(ctx context.Context, timeout time.Duration, args ...string) RunResult {
+	return t.runArgv(ctx, timeout, append(t.BaseWP(), args...))
 }
 
 var reProduction = regexp.MustCompile(`(?i)prod(uction)?\b`)
@@ -69,10 +79,13 @@ type RunResult struct {
 // it printed. stdout and stderr are combined because VIP-CLI and WP-CLI
 // scatter useful lines across both.
 func (t Target) Run(ctx context.Context, timeout time.Duration, args ...string) RunResult {
+	return t.runArgv(ctx, timeout, append(t.Base(), args...))
+}
+
+func (t Target) runArgv(ctx context.Context, timeout time.Duration, full []string) RunResult {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	full := append(t.Base(), args...)
 	cmd := exec.CommandContext(ctx, full[0], full[1:]...)
 	out, err := cmd.CombinedOutput()
 

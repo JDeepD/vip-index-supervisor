@@ -253,6 +253,7 @@ type unlockStatusMsg struct {
 }
 type unlockDoneMsg struct {
 	id   int64
+	ok   bool
 	text string
 }
 
@@ -263,6 +264,7 @@ type unlockScreen struct {
 	stage   string // "checking" | "confirm" | "clearing" | "done"
 	menu    *Menu
 	message string
+	ok      bool
 }
 
 func newUnlockScreen(sess *session) *unlockScreen {
@@ -290,16 +292,39 @@ func (s *unlockScreen) Init() tea.Cmd {
 	return tea.Batch(s.spin.Tick, check)
 }
 
+// clear removes BOTH things a killed run leaves behind: the lock transient
+// and the orphaned sync-state record. Clearing only the transient looks like
+// it worked ("Index cleared.") while get-indexing-status keeps reporting a
+// sync in flight and every later index run is refused.
 func (s *unlockScreen) clear() tea.Cmd {
 	s.stage = "clearing"
 	id, sess := s.id, s.sess
 	return func() tea.Msg {
-		res := sess.client().ClearIndexLock(context.Background())
-		text := strings.TrimSpace(res.Output)
-		if text == "" {
-			text = "Transient cleared."
+		ctx := context.Background()
+		client := sess.client()
+		syncRes := client.ClearSyncRecord(ctx)
+		client.ClearIndexLock(ctx)
+
+		// Report what the platform says now, not what the commands claimed.
+		st := client.Status(ctx)
+		switch {
+		case st != nil && !st.Indexing:
+			return unlockDoneMsg{id: id, ok: true, text: "Lock and sync record cleared — indexing status is now idle."}
+		case st == nil:
+			return unlockDoneMsg{id: id, ok: false,
+				text: "Commands ran, but the indexing status could not be read — verify before starting a run."}
+		default:
+			detail := strings.Join(syncRes.DescribeFailure(), "\n  ")
+			wp := strings.Join(sess.target.BaseWP(), " ")
+			return unlockDoneMsg{id: id, ok: false, text: "The platform STILL reports indexing in progress.\n" +
+				"  If a sync is genuinely running, let it finish. If it is the debris of a killed run, clear it by hand:\n" +
+				"    " + wp + " transient delete ep_wpcli_sync\n" +
+				"    " + wp + " option delete ep_index_meta\n" +
+				"    " + wp + " site option delete ep_index_meta\n" +
+				"    " + wp + " cache delete alloptions options\n" +
+				"    " + wp + " cache delete ep_index_meta options\n" +
+				"  the last cleanup said:\n  " + detail}
 		}
-		return unlockDoneMsg{id: id, text: text}
 	}
 }
 
@@ -320,6 +345,7 @@ func (s *unlockScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		}
 		s.stage = "done"
 		s.message = msg.text
+		s.ok = msg.ok
 		return s, nil
 	case spinner.TickMsg:
 		if s.stage != "checking" && s.stage != "clearing" {
@@ -354,6 +380,9 @@ func (s *unlockScreen) View() string {
 			s.menu.View() +
 			styleHelp.Render("↑/↓ move · enter select · esc back")
 	default:
+		if !s.ok {
+			return styleErr.Render("✗ ") + s.message + styleHelp.Render("\n\nesc back · q quit")
+		}
 		return styleOK.Render("✓ ") + s.message + styleHelp.Render("\n\nesc back · q quit")
 	}
 }

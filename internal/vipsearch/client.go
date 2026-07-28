@@ -258,8 +258,51 @@ func (r RunResult) Succeeded() bool {
 var reErrorFramedLine = regexp.MustCompile(`(?m)^\s*Error:`)
 
 // ClearIndexLock clears the stale "an index is already occurring" transient.
+// This is only the LOCK — a killed run also leaves a sync-state record that
+// keeps get-indexing-status reporting "indexing": see ClearSync.
 func (c *Client) ClearIndexLock(ctx context.Context) RunResult {
 	return c.run(ctx, 2*time.Minute, "delete-transient")
+}
+
+// ClearSyncRecord removes everything a killed indexing process leaves behind.
+//
+// A dead sync blocks all later runs from FOUR keys, not one: the ep_wpcli_sync
+// transient (the flag that raises "An index is already occurring") and the
+// ep_index_meta option (the progress record get-indexing-status prints), each
+// in both the regular and the network/site variant. Clearing only some of them
+// looks like it worked while the platform keeps reporting a sync in flight —
+// which version gets read depends on whether ElasticPress is network-active.
+//
+// ElasticPress documents this cleanup as a single `wp eval` one-liner
+// (10up/ElasticPress#1533), but wp eval is disallowed on VIP, so each key is
+// deleted through its own permitted command. Deleting a key that does not
+// exist is harmless.
+func (c *Client) ClearSyncRecord(ctx context.Context) RunResult {
+	// Order matters. The object-cache deletes come last and are NOT optional:
+	// delete_option() looks up the database row first and returns early when
+	// it is missing, before it ever calls wp_cache_delete(). So once the row
+	// is gone while a stale copy survives in cache — which happens when a
+	// concurrent request re-primes the autoloaded `alloptions` blob — no
+	// amount of option/transient deleting can clear it, and every command
+	// still reports success. ep_index_meta is autoloaded, so get_option()
+	// reads it out of `alloptions` before the individual key.
+	//
+	// `wp site option` (a subcommand of `wp site`) is the network variant;
+	// there is no `wp site-option`.
+	cleanups := [][]string{
+		{"transient", "delete", "ep_wpcli_sync"},
+		{"transient", "delete", "ep_wpcli_sync", "--network"},
+		{"option", "delete", "ep_index_meta"},
+		{"site", "option", "delete", "ep_index_meta"},
+		{"cache", "delete", "alloptions", "options"},
+		{"cache", "delete", "ep_index_meta", "options"},
+	}
+	var last RunResult
+	for _, args := range cleanups {
+		last = c.Target.RunWP(ctx, 2*time.Minute, args...)
+	}
+	c.LastRun = last
+	return last
 }
 
 // StopIndexing asks a running index to stop.
