@@ -10,18 +10,63 @@ kill, connection reset, or a stall — so nobody has to babysit the run.
 Run it on a persistent host (bastion / tmux), **not** inside the VIP
 container: a deploy is what kills the indexing process.
 
-## Build
+## Install on a remote instance
+
+The binaries are published as GitHub release assets — no runtime, no
+dependencies. On a typical remote instance (Linux x86_64):
+
+```
+curl -fsSL -o vip-index-supervisor https://github.com/JDeepD/vip-index-supervisor/releases/latest/download/vip-index-supervisor-linux-amd64
+chmod +x vip-index-supervisor
+./vip-index-supervisor
+```
+
+Or with wget:
+
+```
+wget -O vip-index-supervisor https://github.com/JDeepD/vip-index-supervisor/releases/latest/download/vip-index-supervisor-linux-amd64
+chmod +x vip-index-supervisor
+```
+
+For other machines, swap the asset name:
+
+| platform          | asset                                    |
+|-------------------|------------------------------------------|
+| Linux x86_64      | `vip-index-supervisor-linux-amd64`       |
+| Linux ARM64       | `vip-index-supervisor-linux-arm64`       |
+| macOS Apple Si    | `vip-index-supervisor-darwin-arm64`      |
+| macOS Intel       | `vip-index-supervisor-darwin-amd64`      |
+| Windows x86_64    | `vip-index-supervisor-windows-amd64.exe` |
+
+Pin a version by replacing `latest/download` with `download/<tag>`, e.g.
+`download/v1.0.0`. If the repository is private, plain curl/wget cannot reach
+release assets — use the GitHub CLI instead:
+
+```
+gh release download --repo JDeepD/vip-index-supervisor --pattern 'vip-index-supervisor-linux-amd64'
+```
+
+## Build and release
 
 ```
 go build -o vip-index-supervisor .
 ```
 
-Cross-compile for any OS — the binary is fully static, no runtime needed:
+Cross-compile for every OS — the binary is fully static:
 
 ```
-GOOS=linux  GOARCH=amd64 go build -o vip-index-supervisor-linux .
-GOOS=darwin GOARCH=arm64 go build -o vip-index-supervisor-mac .
-GOOS=windows GOARCH=amd64 go build -o vip-index-supervisor.exe .
+GOOS=linux   GOARCH=amd64 go build -o dist/vip-index-supervisor-linux-amd64 .
+GOOS=linux   GOARCH=arm64 go build -o dist/vip-index-supervisor-linux-arm64 .
+GOOS=darwin  GOARCH=arm64 go build -o dist/vip-index-supervisor-darwin-arm64 .
+GOOS=darwin  GOARCH=amd64 go build -o dist/vip-index-supervisor-darwin-amd64 .
+GOOS=windows GOARCH=amd64 go build -o dist/vip-index-supervisor-windows-amd64.exe .
+```
+
+The asset names above are what the install commands expect. Publish them
+(include `dist/checksums.txt` so downloads can be verified):
+
+```
+gh release create v1.0.0 dist/* --title v1.0.0
 ```
 
 ## Use
