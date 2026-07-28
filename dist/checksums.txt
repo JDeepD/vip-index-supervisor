@@ -1,5 +1,0 @@
-0941c88e761a5112d48823ab1bef747f44ea8b1283068b562d26d6db9db85326  vip-index-supervisor-darwin-amd64
-e4cd592b064ad2abd5eefe06fe7adcb750f697584229c450ccf1c252b96a5f7e  vip-index-supervisor-darwin-arm64
-c1ed4b53152c94a1b182e84f6407a0cecdd70fdbef78e561dd5821bc74c09ec8  vip-index-supervisor-linux-amd64
-d6dd8efad0111cbec744f68fe1402f879f232568578724d3a47b78f5177d453f  vip-index-supervisor-linux-arm64
-d5f5cd31c3b5aaa52f6619ef136c49832df0d3f7079a659907d7563544d6336d  vip-index-supervisor-windows-amd64.exe
