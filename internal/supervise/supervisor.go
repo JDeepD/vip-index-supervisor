@@ -29,6 +29,7 @@ type Supervisor struct {
 	phases     []PhaseSnapshot
 	current    int
 	child      *exec.Cmd
+	childGone  chan struct{}
 	stopped    bool
 	forced     bool
 	samples    []rateSample
@@ -72,24 +73,31 @@ func New(cfg Config) *Supervisor {
 // Events is the stream the UI listens on; it closes after DoneEvent.
 func (s *Supervisor) Events() <-chan Event { return s.events }
 
-// RequestStop asks the run to end at the next safe point. force skips the
-// child's grace period — the user has already waited once.
+// RequestStop asks the run to end at the next safe point.
+//
+// The ordinary stop only raises the flag: the supervisor loop notices within a
+// second and shuts the child down gracefully — asking the platform to stop
+// indexing first, so ElasticPress can clear its own sync record instead of
+// leaving debris that blocks the next run. force skips all of that and kills
+// immediately, which is what a second Ctrl-C asks for.
 func (s *Supervisor) RequestStop(force bool) {
 	s.mu.Lock()
 	s.stopped = true
 	if force {
 		s.forced = true
 	}
-	child := s.child
-	forced := s.forced
+	child, gone := s.child, s.childGone
 	s.mu.Unlock()
-	if child != nil {
-		grace := 2 * time.Second
-		if forced {
-			grace = 0
-		}
-		terminateProcessTree(child, grace)
+
+	if force && child != nil {
+		terminateProcessTree(child, 0, gone)
 	}
+}
+
+func (s *Supervisor) forceRequested() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.forced
 }
 
 // Run drives every phase to completion, blocking until done. Call it from a
@@ -487,6 +495,7 @@ type attemptOutcome struct {
 	lockError bool
 	stalled   bool
 	deadline  bool
+	killed    bool // we ended it, rather than it exiting on its own
 	fatal     string
 	exitErr   error
 	indexed   int64
@@ -523,18 +532,25 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 		return outcome
 	}
 
+	// Closed at stdout EOF, i.e. when the whole child tree has let go of the
+	// pipe. Callers use it to stop waiting out a grace period early.
+	gone := make(chan struct{})
+
 	s.mu.Lock()
 	s.child = cmd
+	s.childGone = gone
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		s.child = nil
+		s.childGone = nil
 		s.mu.Unlock()
 	}()
 
 	lines := make(chan string)
 	go func() {
 		defer close(lines)
+		defer close(gone)
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
@@ -551,6 +567,10 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	ctxDone := ctx.Done()
+	var lastStallProbe string
+	// Set once a shutdown is under way. Without it, ticks that land between
+	// the kill and the pipe reaching EOF would re-run the whole stop sequence.
+	stopping := false
 
 reading:
 	for {
@@ -565,21 +585,40 @@ reading:
 			}
 			s.consumeLine(indexable, version, line, &outcome)
 		case <-ticker.C:
+			if stopping {
+				s.emitProgress()
+				continue
+			}
 			switch {
 			case s.stopRequested():
-				terminateProcessTree(cmd, s.killGrace())
+				stopping = true
+				s.stopChild(ctx, indexable, cmd, gone, !s.forceRequested())
+				outcome.killed = true
 			case s.pastDeadline():
+				stopping = true
 				s.logf(LevelWarn, "[%s] time budget exhausted — stopping the running index", indexable)
-				terminateProcessTree(cmd, 2*time.Second)
+				s.stopChild(ctx, indexable, cmd, gone, true)
 				outcome.deadline = true
+				outcome.killed = true
 			case time.Since(lastOutput) > s.cfg.StallTimeout:
-				s.logf(LevelWarn, "[%s] no output for %s — killing stalled run", indexable, s.cfg.StallTimeout)
-				terminateProcessTree(cmd, 2*time.Second)
+				if s.remoteIsAdvancing(ctx, indexable, &lastStallProbe) {
+					// Silent stdout but the platform is still making
+					// progress: killing here is what manufactures a wedged
+					// index and an orphaned sync record. Keep waiting.
+					lastOutput = time.Now()
+					break
+				}
+				s.logf(LevelWarn, "[%s] no output for %s and the platform reports no progress — stopping the stalled run",
+					indexable, s.cfg.StallTimeout)
+				stopping = true
+				s.stopChild(ctx, indexable, cmd, gone, true)
 				outcome.stalled = true
+				outcome.killed = true
 			}
 			s.emitProgress()
 		case <-ctxDone:
-			terminateProcessTree(cmd, 0)
+			terminateProcessTree(cmd, 0, gone)
+			outcome.killed = true
 			ctxDone = nil // fires once; a closed channel would spin this loop
 		}
 	}
@@ -587,8 +626,82 @@ reading:
 	outcome.exitErr = cmd.Wait()
 	if outcome.success {
 		outcome.exitErr = nil
+		return outcome
 	}
+	// An attempt that did not finish cannot delete its own sync record, and
+	// whatever it left behind blocks the next attempt (and the next phase)
+	// with "an index is already occurring".
+	s.cleanupAfterFailedAttempt(ctx, indexable)
 	return outcome
+}
+
+// stopChild ends the running attempt. When `graceful`, the platform is asked
+// to stop indexing first so ElasticPress can wind down at a batch boundary and
+// delete its own sync record — a hard kill denies it that chance, which is how
+// a killed run leaves debris that blocks everything after it.
+func (s *Supervisor) stopChild(ctx context.Context, indexable string, cmd *exec.Cmd, gone <-chan struct{}, graceful bool) {
+	if !graceful {
+		terminateProcessTree(cmd, 0, gone)
+		return
+	}
+	s.setStatusNote("asking the platform to stop indexing")
+	s.client.StopIndexing(ctx)
+	select {
+	case <-gone: // it wound down on its own; nothing to kill
+		return
+	case <-time.After(remoteStopGrace):
+	}
+	terminateProcessTree(cmd, 2*time.Second, gone)
+}
+
+// remoteStopGrace is how long a `stop-indexing` request is given to take
+// effect before the process tree is signalled. ElasticPress checks the
+// interrupt flag between batches, so this has to outlast a batch.
+const remoteStopGrace = 20 * time.Second
+
+// remoteIsAdvancing reports whether the platform's own indexing status has
+// moved since the previous stall probe. Quiet stdout is not proof of a stall —
+// VIP-CLI buffers, and a long batch prints nothing — so the platform gets a
+// say before anything is killed.
+func (s *Supervisor) remoteIsAdvancing(ctx context.Context, indexable string, previous *string) bool {
+	st := s.client.Status(ctx)
+	if st == nil || !st.Indexing {
+		return false // cannot confirm progress; treat as stalled
+	}
+	current := syncFingerprint(st)
+	if *previous == "" {
+		// First probe: there is nothing to compare against yet. Record the
+		// position and let one more stall interval pass — killing on a single
+		// reading would be exactly the guess this check exists to avoid.
+		*previous = current
+		s.logf(LevelWarn, "[%s] no output for %s — platform is at %s; re-checking before deciding it is stuck",
+			indexable, s.cfg.StallTimeout, current)
+		return true
+	}
+	advanced := *previous != current
+	*previous = current
+	if advanced {
+		s.logf(LevelInfo, "[%s] stdout still quiet, but the platform advanced to %s — not killing it",
+			indexable, current)
+	}
+	return advanced
+}
+
+// cleanupAfterFailedAttempt clears the sync record a dead attempt left behind.
+// A dashboard/cron sync is left alone: only a CLI record can be ours, and ours
+// is the one that just died.
+func (s *Supervisor) cleanupAfterFailedAttempt(ctx context.Context, indexable string) {
+	st := s.client.Status(ctx)
+	if st == nil || !st.Indexing {
+		return // nothing left behind
+	}
+	if st.Method != "" && st.Method != "cli" {
+		s.logf(LevelWarn, "[%s] a %s sync is registered as running — leaving it alone", indexable, st.Method)
+		return
+	}
+	s.logf(LevelInfo, "[%s] clearing the sync record left by the attempt that just died", indexable)
+	s.client.ClearSyncRecord(ctx)
+	s.client.ClearIndexLock(ctx)
 }
 
 func (s *Supervisor) consumeLine(indexable string, version int, line string, outcome *attemptOutcome) {
@@ -746,15 +859,6 @@ func (s *Supervisor) stopRequested() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopped
-}
-
-func (s *Supervisor) killGrace() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.forced {
-		return 0
-	}
-	return 2 * time.Second
 }
 
 func (s *Supervisor) pastDeadline() bool {

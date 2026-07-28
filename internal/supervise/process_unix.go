@@ -17,19 +17,23 @@ func configureProcessGroup(cmd *exec.Cmd) {
 // terminateProcessTree SIGTERMs the child's process group, then SIGKILLs
 // whatever lingers past the grace period. A zero grace skips straight to
 // SIGKILL — what a second Ctrl-C asks for: the user has already waited once.
-func terminateProcessTree(cmd *exec.Cmd, grace time.Duration) {
+//
+// `gone` is closed once the child's output pipe reaches EOF, which is the only
+// reliable in-flight signal that the tree has exited: cmd.ProcessState stays
+// nil until Wait() returns, and Wait() cannot run until the readers finish, so
+// polling it here would always burn the full grace period and then SIGKILL a
+// process that had already exited.
+func terminateProcessTree(cmd *exec.Cmd, grace time.Duration, gone <-chan struct{}) {
 	if cmd.Process == nil {
 		return
 	}
 	pgid := -cmd.Process.Pid
 	if grace > 0 {
 		syscall.Kill(pgid, syscall.SIGTERM)
-		deadline := time.Now().Add(grace)
-		for time.Now().Before(deadline) {
-			if cmd.ProcessState != nil {
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
+		select {
+		case <-gone:
+			return
+		case <-time.After(grace):
 		}
 	}
 	syscall.Kill(pgid, syscall.SIGKILL)
