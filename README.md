@@ -18,7 +18,7 @@ checksum against the release, and puts the binary on PATH
 (`/usr/local/bin` if writable, else `~/.local/bin`):
 
 ```
-curl -fsSL https://raw.githubusercontent.com/JDeepD/vip-index-supervisor/main/install.sh | sh
+curl -fsSL https://vip-index-supervisor.jdeep.in/install.sh | bash
 ```
 
 It is built to be pipe-safe: nothing executes until the whole script has
