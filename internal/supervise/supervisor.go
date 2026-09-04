@@ -249,16 +249,13 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 				s.reportPersistentLock(ctx, indexable, clearedStuckSync)
 				return false
 			}
+			lockWait := lockRetryDelay(lockErrors)
 			s.setStatusNote("clearing stale index lock")
-			s.logf(LevelWarn, "[%s] stale index lock — clearing (delete-transient), retrying in %s", indexable, backoff)
+			s.logf(LevelWarn, "[%s] stale index lock — clearing (delete-transient), retrying in %s", indexable, lockWait)
 			s.client.ClearIndexLock(ctx)
-			if !s.sleep(ctx, backoff) {
+			if !s.sleep(ctx, lockWait) {
 				return false
 			}
-			// Escalate like every other retry: a lock that needs clearing
-			// twice in a row deserves a longer look, not a 5s hammer that
-			// floods the audit log with delete-transient calls.
-			backoff = min(backoff*2, s.cfg.BackoffMax)
 			continue // a stale lock is not a failed attempt
 		}
 		lockErrors = 0
@@ -326,7 +323,24 @@ func (s *Supervisor) completePhase(ctx context.Context, indexable string, versio
 // power over: either a live sync re-asserting it, or a dead run's orphaned
 // sync record. Those need opposite responses, so probe rather than keep
 // hammering delete-transient.
-const maxConsecutiveLockErrors = 3
+const (
+	maxConsecutiveLockErrors = 3
+	maxLockRetryDelay        = time.Minute
+)
+
+// lockRetryDelay is deliberately separate from the general failure backoff.
+// A stale lock gets two bounded chances to disappear before the third error
+// moves into the existing remote-sync diagnosis path.
+func lockRetryDelay(consecutive int) time.Duration {
+	if consecutive <= 0 {
+		return 0
+	}
+	delay := 10 * time.Second
+	if consecutive >= 2 {
+		delay = 30 * time.Second
+	}
+	return min(delay, maxLockRetryDelay)
+}
 
 // syncFreezeProbeDelay is how long the two status reads are apart. A live
 // bulk sync advances thousands of objects in this window; identical numbers
