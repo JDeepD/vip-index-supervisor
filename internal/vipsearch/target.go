@@ -4,6 +4,7 @@
 package vipsearch
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -172,19 +173,21 @@ func (t Target) runArgv(ctx context.Context, timeout time.Duration, full []strin
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, full[0], full[1:]...)
-	childproc.Configure(cmd)
-	cmd.Cancel = func() error { return childproc.Kill(cmd) }
+	process := childproc.New(cmd)
+	cmd.Cancel = process.Kill
 	// A descendant may inherit stdout after the CLI exits. Bound the wait
 	// for those pipes too, including on cancellation.
 	cmd.WaitDelay = 2 * time.Second
-	out, err := cmd.CombinedOutput()
-	if errors.Is(err, exec.ErrWaitDelay) {
-		childproc.Kill(cmd)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := process.Start()
+	if err == nil {
+		err = process.Wait()
 	}
 
 	// VIP-CLI colourises even when piped; strip once here so every parser
 	// downstream (markers, tables, JSON extraction) sees clean text.
-	res := RunResult{Output: StripANSI(string(out)), Err: err}
+	res := RunResult{Output: StripANSI(out.String()), Err: err}
 	if ctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true
 	}

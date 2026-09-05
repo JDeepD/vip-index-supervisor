@@ -373,6 +373,21 @@ do not count as progress, completion, locks, or authorization failures. JSON
 results are schema-checked even with diagnostic text around them. A success
 message cannot override a nonzero exit or an explicit command error.
 
+Local command cleanup is separate from remote sync-state cleanup. On macOS
+and Linux each command gets a private process group; lingering group members
+are killed even when the main command exits successfully or closes its pipes.
+A graceful termination still escalates if the main command exits before its
+helpers. Every directly started command is waited on exactly once, including
+on cancellation, so the supervisor does not leave its own exited children
+unreaped. Output continues draining during shutdown.
+
+This is not machine-wide process containment: descendants that deliberately
+detach into another group, remote VIP workers, and a supervisor killed with
+SIGKILL are outside this guarantee. Orphaned descendants are reaped by the
+OS's adopting process (containers need a functioning init/reaper). Windows
+uses best-effort `taskkill /T` for cancellation, not POSIX process groups.
+The supervisor never scans for or kills unrelated machine processes.
+
 ## Tests
 
 ```sh
@@ -385,7 +400,10 @@ Tests use local fake CLI helper processes and loopback HTTP servers, never
 real VIP sites or real ntfy endpoints. They cover
 noisy and oversized output, string/numeric JSON fields, failed mutations,
 scoped checkpoints, retry sequences, version safeguards, cancellation, and
-output draining during graceful shutdown. Notification tests cover HTTP/auth,
+output draining during graceful shutdown, TERM-ignoring group members,
+leader-first exit, forced-stop races, and direct-child reaping. Local CLI
+integration tests also check that helper PIDs disappear, including zombies.
+Notification tests cover HTTP/auth,
 timeouts, redirects, secret handling, retry rate limits, queue saturation,
 final-alert ordering, settings persistence, UI configuration, and run outcomes.
 Recovery tests cover exact-scope resume, completed-phase skipping, active or

@@ -3,7 +3,6 @@ package supervise
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,8 +35,7 @@ type Supervisor struct {
 	mu         sync.Mutex
 	phases     []PhaseSnapshot
 	current    int
-	child      *exec.Cmd
-	childGone  chan struct{}
+	child      *childproc.Process
 	stopped    bool
 	forced     bool
 	cancelRun  context.CancelFunc
@@ -107,14 +105,14 @@ func (s *Supervisor) RequestStop(force bool) {
 	if force {
 		s.forced = true
 	}
-	child, gone, cancel := s.child, s.childGone, s.cancelRun
+	child, cancel := s.child, s.cancelRun
 	s.mu.Unlock()
 	if cancel != nil && (force || child == nil) {
 		cancel()
 	}
 
 	if force && child != nil {
-		childproc.Terminate(child, 0, gone)
+		child.Kill()
 	}
 }
 
@@ -643,7 +641,7 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 
 	full := append(s.cfg.Target.Base(), args...)
 	cmd := exec.Command(full[0], full[1:]...)
-	childproc.Configure(cmd)
+	process := childproc.New(cmd)
 
 	attemptLog, err := os.OpenFile(outcome.logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -655,7 +653,7 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 	cmd.Stdout = &chunkWriter{chunks: chunks}
 	cmd.Stderr = cmd.Stdout
 	cmd.WaitDelay = 2 * time.Second
-	if err := cmd.Start(); err != nil {
+	if err := process.Start(); err != nil {
 		// Retrying cannot conjure a missing binary; report the fatal it is.
 		outcome.fatal = fmt.Sprintf("could not start %q: %v", full[0], err)
 		return outcome
@@ -663,22 +661,17 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 
 	// Wait runs concurrently with output draining. EOF alone does not mean
 	// the process exited, and a descendant may keep its output pipe open.
-	gone := make(chan struct{})
 	waited := make(chan error, 1)
 	go func() {
-		err := cmd.Wait()
-		close(gone)
-		waited <- err
+		waited <- process.Wait()
 	}()
 
 	s.mu.Lock()
-	s.child = cmd
-	s.childGone = gone
+	s.child = process
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		s.child = nil
-		s.childGone = nil
 		s.mu.Unlock()
 	}()
 
@@ -701,7 +694,7 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 		operations.Add(1)
 		go func() {
 			defer operations.Done()
-			s.stopChild(opCtx, indexable, cmd, gone, graceful)
+			s.stopChild(opCtx, indexable, process, graceful)
 		}()
 	}
 	// Oversized diagnostic lines must not stop the pipe reader. Log every
@@ -748,9 +741,6 @@ reading:
 			}
 		case err := <-waited:
 			outcome.exitErr = err
-			if errors.Is(err, exec.ErrWaitDelay) {
-				childproc.Terminate(cmd, 0, gone)
-			}
 			consume("", true)
 			break reading
 		case probe := <-probes:
@@ -788,7 +778,7 @@ reading:
 			}
 			s.emitProgress()
 		case <-ctxDone:
-			childproc.Terminate(cmd, 0, gone)
+			process.Kill()
 			stopping, outcome.killed = true, true
 			outcome.deadline = ctx.Err() == context.DeadlineExceeded
 			ctxDone = nil // fires once; a closed channel would spin this loop
@@ -815,11 +805,12 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 // to stop indexing first so ElasticPress can wind down at a batch boundary and
 // delete its own sync record — a hard kill denies it that chance, which is how
 // a killed run leaves debris that blocks everything after it.
-func (s *Supervisor) stopChild(ctx context.Context, indexable string, cmd *exec.Cmd, gone <-chan struct{}, graceful bool) {
+func (s *Supervisor) stopChild(ctx context.Context, indexable string, process *childproc.Process, graceful bool) {
 	if !graceful {
-		childproc.Terminate(cmd, 0, gone)
+		process.Kill()
 		return
 	}
+	gone := process.Done()
 	select {
 	case <-gone:
 		return
@@ -833,12 +824,12 @@ func (s *Supervisor) stopChild(ctx context.Context, indexable string, cmd *exec.
 		s.logf(LevelWarn, "[%s] platform stop was not confirmed: %s", indexable, strings.Join(res.DescribeFailure(), "; "))
 	}
 	select {
-	case <-gone: // it wound down on its own; nothing to kill
+	case <-gone: // Wait reaped the child and already attempted local cleanup
 		return
 	case <-time.After(remoteStopGrace):
 	case <-ctx.Done():
 	}
-	childproc.Terminate(cmd, 2*time.Second, gone)
+	process.Terminate(2 * time.Second)
 }
 
 // remoteStopGrace is how long a `stop-indexing` request is given to take

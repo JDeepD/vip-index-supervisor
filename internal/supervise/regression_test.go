@@ -156,6 +156,43 @@ func TestProgressResetsLockSequence(t *testing.T) {
 	}
 }
 
+func TestThreeProgressingLockFailuresResumeFourthAttempt(t *testing.T) {
+	s := testSupervisor(t)
+	s.cfg.Strategy = StrategySetup
+	ids := []int64{3708138, 3329124, 2704733}
+	var waits []time.Duration
+	s.wait = func(_ context.Context, d time.Duration) bool { waits = append(waits, d); return true }
+	i := 0
+	s.attempt = func(_ context.Context, indexable string, version int, args []string) attemptOutcome {
+		if i == 0 {
+			if !containsArg(args, "--setup") {
+				t.Fatal("first attempt did not set up")
+			}
+		} else if containsArg(args, "--setup") || !containsArg(args, "--upper-limit-object-id="+strconv.FormatInt(ids[i-1], 10)) {
+			t.Fatalf("resume must retain progress without rebuilding: %v", args)
+		}
+		if i == len(ids) {
+			i++
+			return attemptOutcome{success: true, indexed: 3872018}
+		}
+		o := attemptOutcome{exitErr: errors.New("test CLI failed")}
+		s.consumeLine(indexable, version, fmt.Sprintf("Processed 300/1000. Last Object ID: %d", ids[i]), &o)
+		s.consumeLine(indexable, version, "Error: An index is already occurring. Try again later.", &o)
+		if !o.lockError || !o.progressed {
+			t.Fatalf("fixture did not reproduce progressing lock failure: %+v", o)
+		}
+		i++
+		return o
+	}
+	if !s.runPhase(context.Background(), "post") || i != 4 {
+		t.Fatalf("three progressing failures prevented fourth resume: %d attempts", i)
+	}
+	want := []time.Duration{s.cfg.BackoffBase, s.cfg.BackoffBase, s.cfg.BackoffBase}
+	if !reflect.DeepEqual(waits, want) || s.client.(*fakeSearch).clears != 0 {
+		t.Fatalf("progressing attempts treated as persistent startup lock: waits=%v, clears=%d", waits, s.client.(*fakeSearch).clears)
+	}
+}
+
 func TestBlockingSyncNeverClearedFromInactivityAlone(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

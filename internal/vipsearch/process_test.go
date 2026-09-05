@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,7 +18,7 @@ func TestCommandProcessTreeCleanup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix process-group lifecycle assertion")
 	}
-	for _, mode := range []string{"cancel", "timeout", "orphan"} {
+	for _, mode := range []string{"cancel", "timeout", "orphan", "orphan-closed-pipes", "failed-closed-pipes"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			exe, err := os.Executable()
@@ -69,8 +70,8 @@ func TestCommandProcessTreeCleanup(t *testing.T) {
 			}
 			select {
 			case res := <-result:
-				if res.Err == nil {
-					t.Fatalf("unexpected success: %+v", res)
+				if (res.Err == nil) != (mode == "orphan-closed-pipes") {
+					t.Fatalf("incorrect exit result: %+v", res)
 				}
 				if mode == "timeout" && !res.TimedOut {
 					t.Fatalf("timeout lost: %+v", res)
@@ -88,8 +89,41 @@ func TestCommandProcessTreeCleanup(t *testing.T) {
 			if string(before) != string(after) {
 				t.Fatal("local grandchild kept running after command ended")
 			}
+			// No heartbeat alone cannot distinguish a dead/reaped process
+			// from a zombie. Verify the exact test PIDs leave the process table.
+			assertTreeHelperGone(t, pid)
+			parent, err := os.ReadFile(filepath.Join(dir, "parent.pid"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parentPID, err := strconv.Atoi(string(parent))
+			if err != nil || parentPID <= 1 {
+				t.Fatalf("invalid helper PID: %q", parent)
+			}
+			assertTreeHelperGone(t, parentPID)
 		})
 	}
+}
+
+func assertTreeHelperGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var state string
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		out, err := exec.CommandContext(ctx, "ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+		cancel()
+		var exitErr *exec.ExitError
+		state = strings.TrimSpace(string(out))
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && state == "" {
+			return
+		}
+		if err != nil {
+			t.Fatalf("cannot check helper PID %d: %v", pid, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("helper PID %d still present after cleanup (state %q, Z means zombie)", pid, state)
 }
 
 func TestCommandTreeHelper(t *testing.T) {
@@ -117,15 +151,32 @@ func TestCommandTreeHelper(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "parent.pid"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+		os.Exit(2)
+	}
+	mode := os.Getenv("VIP_SUPERVISOR_TREE_MODE")
 	cmd := exec.Command(exe, "-test.run=^TestCommandTreeHelper$", "--")
 	cmd.Env = append(os.Environ(), "VIP_SUPERVISOR_TREE_ROLE=child")
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if mode != "orphan-closed-pipes" && mode != "failed-closed-pipes" {
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	}
 	if err := cmd.Start(); err != nil {
 		os.Exit(2)
 	}
 	cmd.Process.Release()
+	if mode == "orphan-closed-pipes" || mode == "failed-closed-pipes" {
+		for i := 0; i < 500; i++ {
+			if _, err := os.Stat(filepath.Join(dir, "child.pid")); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	fmt.Println(`{"indexing":true}`)
-	if os.Getenv("VIP_SUPERVISOR_TREE_MODE") == "orphan" {
+	if mode == "failed-closed-pipes" {
+		os.Exit(7)
+	}
+	if mode == "orphan" || mode == "orphan-closed-pipes" {
 		os.Exit(0)
 	}
 	time.Sleep(20 * time.Second)
