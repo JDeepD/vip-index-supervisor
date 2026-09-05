@@ -387,13 +387,29 @@ func (s *versionMutateScreen) Init() tea.Cmd { return nil }
 // back to confirm; and after completion it must take the same
 // back-past-the-stale-action-menu route as enter — a plain single pop would
 // resurface an action menu for a version that may no longer exist.
-func (s *versionMutateScreen) OwnsEsc() bool { return s.stage != "confirm" }
+func (s *versionMutateScreen) OwnsEsc() bool   { return s.stage != "confirm" }
+func (s *versionMutateScreen) OwnsCtrlC() bool { return s.stage == "running" }
 
 func (s *versionMutateScreen) execute() tea.Cmd {
 	s.stage = "running"
 	id, sess, indexable, kind, version := s.id, s.sess, s.indexable, s.kind, s.selected.Number
 	return tea.Batch(s.spin.Tick, func() tea.Msg {
 		client := sess.client()
+		// The action menu may be stale after another operator activates an
+		// index. Never delete based solely on that cached list.
+		rows := client.Versions(context.Background(), indexable)
+		found := false
+		for _, row := range rows {
+			if row.Number == version {
+				found = true
+				if kind == mutateDelete && row.Active {
+					return mutateDoneMsg{id: id, message: "This version is now active; refusing to delete it. Refresh Versions."}
+				}
+			}
+		}
+		if !found {
+			return mutateDoneMsg{id: id, message: "The selected version could not be confirmed. Refresh Versions before retrying."}
+		}
 		var res vipsearch.RunResult
 		if kind == mutateActivate {
 			res = client.ActivateVersion(context.Background(), indexable, version)
@@ -403,6 +419,21 @@ func (s *versionMutateScreen) execute() tea.Cmd {
 		if !res.Succeeded() {
 			return mutateDoneMsg{id: id, ok: false,
 				message: strings.Join(res.DescribeFailure(), "\n  ")}
+		}
+		rows = client.Versions(context.Background(), indexable)
+		confirmed := len(rows) > 0
+		if kind == mutateActivate {
+			active := vipsearch.ActiveVersion(rows)
+			confirmed = active != nil && active.Number == version
+		} else {
+			for _, row := range rows {
+				if row.Number == version {
+					confirmed = false
+				}
+			}
+		}
+		if !confirmed {
+			return mutateDoneMsg{id: id, message: "Command acknowledged, but its result could not be verified. Refresh Versions before doing anything else."}
 		}
 		return mutateDoneMsg{id: id, ok: true, message: strings.TrimSpace(res.Output)}
 	})

@@ -4,12 +4,15 @@
 package supervise
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/jdeepd/vip-index-supervisor/internal/notify"
 	"github.com/jdeepd/vip-index-supervisor/internal/vipsearch"
 )
 
@@ -55,11 +58,13 @@ type Config struct {
 	// IntoVersion is the existing version StrategyIntoVersion builds into.
 	IntoVersion int
 	// ResumeFrom forces the starting object ID, overriding checkpoints and
-	// the live resume point. Only meaningful with a single indexable.
+	// automatic selection. Only meaningful with a single indexable.
 	ResumeFrom int64
 	ShowErrors bool
 
-	StateDir string
+	StateDir      string
+	Notifications notify.Config `json:"-"`
+	ResumeRunID   string        `json:"-"` // load and revalidate this history entry under the state lock
 
 	MaxRetries       int
 	BackoffBase      time.Duration
@@ -107,8 +112,52 @@ func (c *Config) Normalize() {
 		c.VerifyDelay = 5 * time.Second
 	}
 	if c.StateDir == "" {
-		c.StateDir = defaultStateDir(c.Target.Label())
+		label := c.Target.Label()
+		if !c.Target.IsVIP() {
+			wd, _ := os.Getwd()
+			digest := sha256.Sum256([]byte(wd + "\x00" + strings.Join(c.Target.BaseWP(), "\x00")))
+			label = fmt.Sprintf("local-%x", digest[:8])
+		}
+		c.StateDir = defaultStateDir(label)
 	}
+	if absolute, err := filepath.Abs(c.StateDir); err == nil {
+		c.StateDir = absolute
+	}
+}
+
+func (c Config) Validate() error {
+	if c.ResumeRunID != "" && !validRunID(c.ResumeRunID) {
+		return fmt.Errorf("invalid saved run ID")
+	}
+	if err := c.Target.Validate(); err != nil {
+		return err
+	}
+	if c.Strategy < StrategyResume || c.Strategy > StrategyIntoVersion {
+		return fmt.Errorf("unknown indexing strategy")
+	}
+	if c.Strategy == StrategyIntoVersion && c.IntoVersion <= 0 {
+		return fmt.Errorf("an existing version must be positive")
+	}
+	if c.ResumeFrom < 0 || c.MaxDuration < 0 {
+		return fmt.Errorf("resume ID and time budget cannot be negative")
+	}
+	if c.ResumeFrom > 0 && (len(c.Indexables) != 1 || c.Strategy == StrategySetup) {
+		return fmt.Errorf("a forced resume ID requires one indexable and cannot be combined with --setup")
+	}
+	seen := make(map[string]bool)
+	for _, name := range c.Indexables {
+		if !regexp.MustCompile(`^[\w-]+$`).MatchString(name) || seen[name] {
+			return fmt.Errorf("invalid or duplicate indexable %q", name)
+		}
+		seen[name] = true
+	}
+	if c.BackoffBase > c.BackoffMax {
+		return fmt.Errorf("initial backoff exceeds maximum backoff")
+	}
+	if c.MinDocumentRatio > 1 {
+		return fmt.Errorf("minimum document ratio cannot exceed 1")
+	}
+	return nil
 }
 
 var reUnsafe = regexp.MustCompile(`[^\w.-]+`)

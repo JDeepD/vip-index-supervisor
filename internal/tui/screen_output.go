@@ -87,8 +87,8 @@ func (s *outputScreen) fetch() tea.Cmd {
 		case "stop":
 			res := client.StopIndexing(ctx)
 			text = strings.TrimSpace(res.Output)
-			if text == "" {
-				text = "Stop requested."
+			if !res.Succeeded() {
+				text = "Stop request could not be confirmed.\n" + strings.Join(res.DescribeFailure(), "\n")
 			}
 		}
 		return outputResultMsg{id: id, text: text}
@@ -281,7 +281,9 @@ func newUnlockScreen(sess *session) *unlockScreen {
 	}
 }
 
-func (s *unlockScreen) Title() string { return "unlock" }
+func (s *unlockScreen) Title() string   { return "unlock" }
+func (s *unlockScreen) OwnsEsc() bool   { return s.stage == "clearing" }
+func (s *unlockScreen) OwnsCtrlC() bool { return s.stage == "clearing" }
 
 func (s *unlockScreen) Init() tea.Cmd {
 	id, sess := s.id, s.sess
@@ -303,11 +305,14 @@ func (s *unlockScreen) clear() tea.Cmd {
 		ctx := context.Background()
 		client := sess.client()
 		syncRes := client.ClearSyncRecord(ctx)
-		client.ClearIndexLock(ctx)
+		lockRes := client.ClearIndexLock(ctx)
 
 		// Report what the platform says now, not what the commands claimed.
 		st := client.Status(ctx)
 		switch {
+		case st != nil && !st.Indexing && (syncRes.Failed() || !lockRes.Succeeded()):
+			return unlockDoneMsg{id: id, ok: false, text: "Status is now idle, but some cleanup commands failed.\n" +
+				strings.Join(append(syncRes.DescribeFailure(), lockRes.DescribeFailure()...), "\n")}
 		case st != nil && !st.Indexing:
 			return unlockDoneMsg{id: id, ok: true, text: "Lock and sync record cleared — indexing status is now idle."}
 		case st == nil:
@@ -334,8 +339,12 @@ func (s *unlockScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		if msg.id != s.id {
 			return s, nil
 		}
-		if msg.running {
+		if msg.running || !msg.known {
 			s.stage = "confirm"
+			s.message = "Status reports indexing in progress."
+			if !msg.known {
+				s.message = "Indexing status is unknown — the lock has not been changed."
+			}
 			return s, nil
 		}
 		return s, s.clear()
@@ -355,6 +364,9 @@ func (s *unlockScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		s.spin, cmd = s.spin.Update(msg)
 		return s, cmd
 	case tea.KeyMsg:
+		if s.stage == "clearing" {
+			return s, nil
+		}
 		if msg.String() == "q" {
 			return s, tea.Quit
 		}
@@ -375,8 +387,8 @@ func (s *unlockScreen) View() string {
 	case "clearing":
 		return s.spin.View() + " clearing the index lock (delete-transient)…"
 	case "confirm":
-		return styleWarn.Render("Status reports indexing in progress.") + "\n" +
-			styleDim.Render("A hard-killed run also leaves this flag set — but so does a genuinely running index.") + "\n\n" +
+		return styleWarn.Render(s.message) + "\n" +
+			styleDim.Render("Only clear this state after confirming that no indexer is running.") + "\n\n" +
 			s.menu.View() +
 			styleHelp.Render("↑/↓ move · enter select · esc back")
 	default:

@@ -1,9 +1,9 @@
 package supervise
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jdeepd/vip-index-supervisor/internal/childproc"
+	"github.com/jdeepd/vip-index-supervisor/internal/notify"
 	"github.com/jdeepd/vip-index-supervisor/internal/vipsearch"
 )
 
@@ -20,10 +22,16 @@ import (
 // failure and checkpointing progress so a restart never loses work. It talks
 // to the outside world only through its event channel.
 type Supervisor struct {
-	cfg    Config
-	client *vipsearch.Client
-	store  checkpointStore
-	events chan Event
+	cfg           Config
+	client        searchClient
+	store         checkpointStore
+	notifications *notify.Dispatcher
+	history       *RunRecord
+	resumed       *RunRecord
+	events        chan Event
+	// Internal boundaries keep retry policy testable without real waits or VIP.
+	attempt func(context.Context, string, int, []string) attemptOutcome
+	wait    func(context.Context, time.Duration) bool
 
 	mu         sync.Mutex
 	phases     []PhaseSnapshot
@@ -32,6 +40,7 @@ type Supervisor struct {
 	childGone  chan struct{}
 	stopped    bool
 	forced     bool
+	cancelRun  context.CancelFunc
 	samples    []rateSample
 	phaseStart time.Time
 	startedAt  time.Time
@@ -47,6 +56,16 @@ type Supervisor struct {
 	eventsFile *os.File
 }
 
+type searchClient interface {
+	Versions(context.Context, string) []vipsearch.IndexVersion
+	Status(context.Context) *vipsearch.IndexingStatus
+	AddVersion(context.Context, string) vipsearch.RunResult
+	ActivateVersion(context.Context, string, int) vipsearch.RunResult
+	ClearIndexLock(context.Context) vipsearch.RunResult
+	StopIndexing(context.Context) vipsearch.RunResult
+	LastResult() vipsearch.RunResult
+}
+
 type rateSample struct {
 	at   time.Time
 	done int64
@@ -60,7 +79,7 @@ func New(cfg Config) *Supervisor {
 		phases[i] = PhaseSnapshot{Name: name, Status: PhasePending,
 			Done: vipsearch.NoValue, Total: vipsearch.NoValue, LastObjectID: vipsearch.NoValue}
 	}
-	return &Supervisor{
+	s := &Supervisor{
 		cfg:     cfg,
 		client:  vipsearch.NewClient(cfg.Target),
 		store:   checkpointStore{dir: cfg.StateDir, postTypes: cfg.PostTypes},
@@ -68,6 +87,8 @@ func New(cfg Config) *Supervisor {
 		phases:  phases,
 		current: -1,
 	}
+	s.attempt, s.wait = s.runAttempt, s.sleep
+	return s
 }
 
 // Events is the stream the UI listens on; it closes after DoneEvent.
@@ -86,11 +107,14 @@ func (s *Supervisor) RequestStop(force bool) {
 	if force {
 		s.forced = true
 	}
-	child, gone := s.child, s.childGone
+	child, gone, cancel := s.child, s.childGone, s.cancelRun
 	s.mu.Unlock()
+	if cancel != nil && (force || child == nil) {
+		cancel()
+	}
 
 	if force && child != nil {
-		terminateProcessTree(child, 0, gone)
+		childproc.Terminate(child, 0, gone)
 	}
 }
 
@@ -104,21 +128,47 @@ func (s *Supervisor) forceRequested() bool {
 // goroutine and consume Events; the exit code arrives as DoneEvent.
 func (s *Supervisor) Run(ctx context.Context) {
 	defer close(s.events)
-
-	if err := s.prepareStateDir(); err != nil {
-		s.events <- DoneEvent{ExitCode: 2, Message: err.Error()}
+	defer s.closeLogs()
+	defer s.closeNotifications()
+	s.startNotifications()
+	ctx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	s.mu.Lock()
+	s.cancelRun = cancelRun
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.cancelRun = nil; s.mu.Unlock() }()
+	if err := s.cfg.Validate(); err != nil {
+		s.finish(DoneEvent{ExitCode: 2, Message: err.Error()})
 		return
 	}
-	defer s.closeLogs()
+	if s.cfg.MaxDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.cfg.MaxDuration)
+		defer cancel()
+	}
+
+	if err := s.prepareStateDir(); err != nil {
+		s.finish(DoneEvent{ExitCode: 2, Message: err.Error()})
+		return
+	}
 
 	if !s.cfg.IgnoreLock {
 		lock, err := acquireStateLock(s.cfg.StateDir)
 		if err != nil {
-			s.events <- DoneEvent{ExitCode: 2, Message: fmt.Sprintf(
-				"%v\nConcurrent runs corrupt each other's checkpoints. Wait for it to finish or use a different state dir.", err)}
+			s.finish(DoneEvent{ExitCode: 2, Message: fmt.Sprintf(
+				"%v\nConcurrent runs corrupt each other's checkpoints. Wait for it to finish or use a different state dir.", err)})
 			return
 		}
 		defer lock.Release()
+	}
+
+	if err := s.restoreRun(ctx); err != nil {
+		s.finish(DoneEvent{ExitCode: 2, Message: "saved-run recovery blocked: " + err.Error()})
+		return
+	}
+	if err := s.startHistory(); err != nil {
+		s.finish(DoneEvent{ExitCode: 2, Message: "could not create run history: " + err.Error()})
+		return
 	}
 
 	if removed := cleanOldAttemptLogs(filepath.Join(s.cfg.StateDir, "logs")); removed > 0 {
@@ -131,36 +181,66 @@ func (s *Supervisor) Run(ctx context.Context) {
 	}
 	s.logf(LevelInfo, "===== supervisor start (target: %s, phases: %s, strategy: %s) =====",
 		s.cfg.Target.Label(), strings.Join(s.cfg.Indexables, ", "), s.cfg.Strategy)
+	s.notifyChange("Run started", "Starting "+strings.Join(s.cfg.Indexables, ", ")+" ("+s.cfg.Strategy.String()+").", 3, "arrow_forward")
 
 	if problems := s.preflight(ctx); len(problems) > 0 {
+		if s.finishInterrupted(ctx) {
+			return
+		}
 		for _, problem := range problems {
 			s.logf(LevelError, "preflight: %s", problem)
 		}
-		s.events <- DoneEvent{ExitCode: 2, Message: "preflight failed — nothing was started"}
+		s.finish(DoneEvent{ExitCode: 2, Message: "preflight failed — nothing was started"})
 		return
 	}
 	s.logf(LevelInfo, "preflight ok — every indexable is registered")
 
 	for i, indexable := range s.cfg.Indexables {
-		if s.stopRequested() {
+		if s.stopRequested() || ctx.Err() != nil {
 			break
+		}
+		if s.phases[i].Status == PhaseComplete {
+			s.logf(LevelInfo, "[%s] already completed in the saved run — skipping", indexable)
+			continue
 		}
 		s.beginPhase(i)
 		if !s.runPhase(ctx, indexable) {
+			if s.finishInterrupted(ctx) {
+				return
+			}
+			s.updatePhase(func(p *PhaseSnapshot) { p.Status = PhaseFailed })
+			cause := ""
+			if s.history != nil {
+				cause = s.history.LastError
+			}
 			s.logf(LevelError, "phase '%s' did not complete", indexable)
-			s.events <- DoneEvent{ExitCode: 1, Message: fmt.Sprintf("phase '%s' did not complete", indexable)}
+			if cause != "" {
+				s.history.LastError = cause
+			}
+			s.finish(DoneEvent{ExitCode: 1, Message: fmt.Sprintf("phase '%s' did not complete", indexable)})
 			return
 		}
 	}
 
-	if s.stopRequested() {
-		s.logf(LevelWarn, "interrupted by user")
-		s.events <- DoneEvent{ExitCode: 130, Message: "interrupted — re-run to resume from the checkpoint"}
+	if s.finishInterrupted(ctx) {
 		return
 	}
 	elapsed := time.Since(s.startedAt).Round(time.Second)
 	s.logf(LevelOK, "ALL PHASES COMPLETE (%s) in %s", strings.Join(s.cfg.Indexables, ", "), elapsed)
-	s.events <- DoneEvent{ExitCode: 0, Message: "all phases complete in " + elapsed.String()}
+	s.finish(DoneEvent{ExitCode: 0, Message: "all phases complete in " + elapsed.String()})
+}
+
+func (s *Supervisor) finishInterrupted(ctx context.Context) bool {
+	if s.stopRequested() || ctx.Err() == context.Canceled {
+		s.logf(LevelWarn, "interrupted by user")
+		s.finish(DoneEvent{ExitCode: 130, Message: "interrupted — re-run to resume from the checkpoint"})
+		return true
+	}
+	if ctx.Err() == context.DeadlineExceeded || s.pastDeadline() {
+		s.finish(DoneEvent{ExitCode: 1, Message: "time budget exhausted — re-run to resume from the checkpoint"})
+		return true
+	}
+	return false
 }
 
 // -- one phase --------------------------------------------------------------
@@ -172,10 +252,29 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 		return false
 	}
 	s.updatePhase(func(p *PhaseSnapshot) { p.Version = version; p.Status = PhaseRunning })
+	if err := s.persistHistory(); err != nil {
+		s.logf(LevelError, "could not save selected version: %v", err)
+		return false
+	}
+	if s.phases[s.current].IndexingComplete {
+		s.logf(LevelInfo, "[%s] indexing already finished — retrying completion checks only", indexable)
+		return s.completePhase(ctx, indexable, version, attemptOutcome{success: true, indexed: vipsearch.NoValue})
+	}
 
 	checkpoint := s.resolveStartCheckpoint(ctx, indexable, version)
+	setupPending := s.cfg.Strategy == StrategySetup && s.resumed == nil
+	if setupPending || (s.resumed != nil && checkpoint <= 0) {
+		if err := s.store.ClearCheckpoint(indexable, version); err != nil {
+			s.logf(LevelError, "[%s] cannot clear the old checkpoint before --setup: %v", indexable, err)
+			return false
+		}
+	}
 	if checkpoint > 0 {
-		s.store.WriteCheckpoint(indexable, version, checkpoint)
+		if err := s.store.WriteCheckpoint(indexable, version, checkpoint); err != nil {
+			s.logf(LevelError, "[%s] cannot save starting checkpoint: %v", indexable, err)
+			return false
+		}
+		s.updatePhase(func(p *PhaseSnapshot) { p.LastObjectID = checkpoint })
 		s.logf(LevelInfo, "phase '%s' starting (resume from id %s%s)",
 			indexable, formatInt(checkpoint), versionNote(version))
 	} else {
@@ -184,10 +283,11 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 
 	noProgress := 0
 	lockErrors := 0
-	clearedStuckSync := false
+	clearedIdleLock := false
 	backoff := s.cfg.BackoffBase
+	priorAttempts := s.phases[s.current].Attempt
 
-	for !s.stopRequested() {
+	for !s.stopRequested() && ctx.Err() == nil {
 		if s.pastDeadline() {
 			s.logf(LevelError, "[%s] time budget exhausted — stopping. Re-run to resume from id %s.",
 				indexable, formatInt(s.store.ReadCheckpoint(indexable, version)))
@@ -195,7 +295,7 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 		}
 
 		attempt := s.nextAttempt()
-		if attempt > s.cfg.MaxRetries {
+		if attempt-priorAttempts > s.cfg.MaxRetries {
 			s.logf(LevelError, "[%s] exceeded max retries — aborting", indexable)
 			return false
 		}
@@ -203,16 +303,31 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 		if cp := s.store.ReadCheckpoint(indexable, version); cp > 0 {
 			checkpoint = cp
 		}
-		args := s.buildIndexArgs(indexable, attempt, checkpoint, version)
+		argsAttempt := attempt
+		if setupPending {
+			argsAttempt = 1
+		} else if s.cfg.Strategy == StrategySetup {
+			argsAttempt = max(2, argsAttempt) // saved-run recovery never repeats --setup
+		}
+		args := s.buildIndexArgs(indexable, argsAttempt, checkpoint, version)
 		s.logAttemptStart(indexable, attempt, checkpoint, args)
+		if err := s.recordAttempt(indexable, version, attempt); err != nil {
+			s.logf(LevelError, "[%s] could not save attempt before starting: %v", indexable, err)
+			return false
+		}
 
 		before := s.lastObjectID()
-		outcome := s.runAttempt(ctx, indexable, version, args)
+		outcome := s.attempt(ctx, indexable, version, args)
+		if outcome.success {
+			s.updatePhase(func(p *PhaseSnapshot) { p.IndexingComplete = true })
+		}
+		if err := s.finishAttempt(outcome); err != nil {
+			s.logf(LevelError, "[%s] could not save attempt result: %v", indexable, err)
+			return false
+		}
 
 		switch {
-		case outcome.success:
-			return s.completePhase(ctx, indexable, version, outcome)
-		case s.stopRequested():
+		case s.stopRequested() || ctx.Err() != nil:
 			return false
 		case outcome.fatal != "":
 			s.updatePhase(func(p *PhaseSnapshot) { p.Status = PhaseFailed; p.StatusNote = outcome.fatal })
@@ -221,23 +336,22 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 		case outcome.deadline:
 			s.logf(LevelError, "[%s] stopped: time budget exhausted", indexable)
 			return false
+		case outcome.success:
+			return s.completePhase(ctx, indexable, version, outcome)
 		}
 
 		s.updatePhase(func(p *PhaseSnapshot) { p.Restarts++ })
 
-		if outcome.lockError {
+		if outcome.lockError && !outcome.progressed {
 			lockErrors++
 			if lockErrors >= maxConsecutiveLockErrors {
-				// delete-transient only clears the CLI lock. A dead
-				// dashboard/cron sync blocks indexing from a different place
-				// (its own sync state), which needs stop-indexing — but only
-				// once, and only if the blocking sync is provably frozen.
-				if !clearedStuckSync {
-					cleared, diagnosed := s.clearStuckSyncIfFrozen(ctx, indexable)
+				// Cleanup is bounded to once, and only after known-idle status.
+				if !clearedIdleLock {
+					cleared, diagnosed := s.diagnoseBlockingSync(ctx, indexable)
 					if cleared {
-						clearedStuckSync = true
+						clearedIdleLock = true
 						lockErrors = 0
-						if !s.sleep(ctx, s.cfg.BackoffBase) {
+						if !s.wait(ctx, s.cfg.BackoffBase) {
 							return false
 						}
 						continue
@@ -246,19 +360,24 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 						return false // the failure was already explained
 					}
 				}
-				s.reportPersistentLock(ctx, indexable, clearedStuckSync)
+				s.reportPersistentLock(ctx, indexable, clearedIdleLock)
 				return false
 			}
 			lockWait := lockRetryDelay(lockErrors)
-			s.setStatusNote("clearing stale index lock")
-			s.logf(LevelWarn, "[%s] stale index lock — clearing (delete-transient), retrying in %s", indexable, lockWait)
-			s.client.ClearIndexLock(ctx)
-			if !s.sleep(ctx, lockWait) {
+			s.setStatusNote("index lock reported — waiting")
+			s.logf(LevelWarn, "[%s] index lock reported — retrying in %s without changing remote state", indexable, lockWait)
+			s.notifyRetry(indexable, "Index lock reported; retrying in "+lockWait.String()+" without clearing remote state.")
+			if !s.wait(ctx, lockWait) {
 				return false
 			}
 			continue // a stale lock is not a failed attempt
 		}
 		lockErrors = 0
+		if setupPending && !outcome.progressed {
+			s.logf(LevelError, "[%s] --setup exited before confirming progress; setup may be incomplete. Inspect %s before choosing rebuild or resume.", indexable, outcome.logPath)
+			return false
+		}
+		setupPending = false
 
 		after := s.lastObjectID()
 		progressed := after != vipsearch.NoValue && (before == vipsearch.NoValue || after < before)
@@ -280,7 +399,8 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 		}
 
 		s.setStatusNote("retrying in " + backoff.String())
-		if !s.sleep(ctx, backoff) {
+		s.notifyRetry(indexable, "Indexing attempt ended; retrying in "+backoff.String()+" from the saved checkpoint.")
+		if !s.wait(ctx, backoff) {
 			return false
 		}
 	}
@@ -298,12 +418,17 @@ func (s *Supervisor) completePhase(ctx context.Context, indexable string, versio
 		// chose that version deliberately and decides when it serves search.
 		s.logf(LevelOK, "[%s] version %d built — activate it from the versions screen when ready", indexable, version)
 	}
-	s.store.ClearCheckpoint(indexable, version)
+	if err := s.store.ClearCheckpoint(indexable, version); err != nil {
+		s.logf(LevelError, "[%s] indexing completed but the checkpoint could not be removed: %v", indexable, err)
+		return false
+	}
 
 	s.mu.Lock()
 	p := &s.phases[s.current]
 	p.Status = PhaseComplete
 	p.StatusNote = ""
+	p.IndexingComplete = true
+	p.NotifiedPercent = 100
 	indexed := outcome.indexed
 	if indexed == vipsearch.NoValue {
 		indexed = p.Done
@@ -311,18 +436,23 @@ func (s *Supervisor) completePhase(ctx context.Context, indexable string, versio
 	elapsed := time.Since(s.phaseStart)
 	attempts := p.Attempt
 	s.mu.Unlock()
+	if err := s.persistHistory(); err != nil {
+		s.logf(LevelError, "[%s] could not save phase completion: %v", indexable, err)
+		return false
+	}
 
 	s.logf(LevelOK, "[%s] COMPLETE — %s objects in %s (%d attempt(s))",
 		indexable, formatInt(indexed), elapsed.Round(time.Second), attempts)
+	// The final run notification supplies the final phase's 100% alert.
+	if s.current < len(s.phases)-1 {
+		s.notifyChange("100% — "+indexable, indexable+" completed in "+elapsed.Round(time.Second).String()+".", 3, "white_check_mark")
+	}
 	s.emitProgress()
 	return true
 }
 
-// A genuinely stale lock clears on the first delete-transient. If the second
-// attempt is refused too, the block is coming from somewhere the lock has no
-// power over: either a live sync re-asserting it, or a dead run's orphaned
-// sync record. Those need opposite responses, so probe rather than keep
-// hammering delete-transient.
+// Lock refusals get two waits before diagnosis. They are not proof of a dead
+// worker, so neither wait deletes any state.
 const (
 	maxConsecutiveLockErrors = 3
 	maxLockRetryDelay        = time.Minute
@@ -342,70 +472,57 @@ func lockRetryDelay(consecutive int) time.Duration {
 	return min(delay, maxLockRetryDelay)
 }
 
-// syncFreezeProbeDelay is how long the two status reads are apart. A live
-// bulk sync advances thousands of objects in this window; identical numbers
-// mean the recorded sync is dead.
+// Identical status in this window is not proof that a remote process is dead.
 const syncFreezeProbeDelay = 15 * time.Second
 
-// clearStuckSyncIfFrozen checks whether the sync blocking this phase is
-// actually advancing. A provably frozen one is the debris of a killed run and
-// gets cleared so the phase can retry; a live one is never touched.
+// diagnoseBlockingSync never deletes state reported as active or unknown.
+// Two reads distinguish movement from apparent inactivity, not live from dead.
 //
 // cleared says the block is gone; diagnosed says the situation was already
 // explained to the user, so the caller must not add a second, vaguer verdict.
-func (s *Supervisor) clearStuckSyncIfFrozen(ctx context.Context, indexable string) (cleared, diagnosed bool) {
+func (s *Supervisor) diagnoseBlockingSync(ctx context.Context, indexable string) (cleared, diagnosed bool) {
 	first := s.client.Status(ctx)
-	if first == nil || !first.Indexing {
+	if first == nil {
 		return false, false
+	}
+	if !first.Indexing {
+		return s.clearIdleLock(ctx, indexable), true
 	}
 	s.setStatusNote("blocking sync found — probing whether it is alive")
 	s.logf(LevelInfo, "[%s] a %s sync reports in-progress — re-reading status in %s to see if it is advancing",
 		indexable, syncMethod(first), syncFreezeProbeDelay)
-	if !s.sleep(ctx, syncFreezeProbeDelay) {
-		return false, false
+	if !s.wait(ctx, syncFreezeProbeDelay) {
+		return false, true
 	}
 	second := s.client.Status(ctx)
 	if second == nil {
 		return false, false
 	}
 	if !second.Indexing {
-		return false, false // it finished on its own; a plain retry will do
+		return s.clearIdleLock(ctx, indexable), true
 	}
 	if syncFingerprint(first) != syncFingerprint(second) {
-		return false, false // advancing — genuinely active, do not interfere
+		s.logf(LevelError, "[%s] blocking sync changed during the probe; leaving it untouched. Let it finish before resuming.", indexable)
+		return false, true
 	}
 	s.logf(LevelWarn,
-		"[%s] the blocking %s sync is FROZEN (no movement in %s, stuck at %s) — it is the debris of a killed run; clearing its sync record",
+		"[%s] blocking %s sync showed no movement in %s (%s). This does not prove it is dead; no remote state was cleared. Confirm no indexer is running before using unlock, then resume.",
 		indexable, syncMethod(second), syncFreezeProbeDelay, syncFingerprint(second))
-	return s.clearOrphanedSync(ctx, indexable), true
+	return false, true
 }
 
-// clearOrphanedSync removes a dead run's sync-state record and verifies the
-// platform now reports idle. stop-indexing is deliberately NOT used: it only
-// raises an interrupt flag for a live process to act on, so against a dead
-// sync it reports success and changes nothing.
-func (s *Supervisor) clearOrphanedSync(ctx context.Context, indexable string) bool {
-	s.logf(LevelWarn, "[%s] clearing the killed run's leftovers (ep_wpcli_sync transient + ep_index_meta record, regular and network)", indexable)
-	res := s.client.ClearSyncRecord(ctx)
-	s.client.ClearIndexLock(ctx)
-
-	// Trust nothing: re-read the status rather than assume the delete worked.
-	if st := s.client.Status(ctx); st != nil && !st.Indexing {
-		s.logf(LevelOK, "[%s] sync record cleared — the platform now reports idle", indexable)
+func (s *Supervisor) clearIdleLock(ctx context.Context, indexable string) bool {
+	if ctx.Err() != nil || s.stopRequested() {
+		return false
+	}
+	res := s.client.ClearIndexLock(ctx)
+	if res.Succeeded() {
+		s.logf(LevelInfo, "[%s] status reports idle; delete-transient acknowledged, retrying once more", indexable)
 		return true
 	}
 	for _, line := range res.DescribeFailure() {
 		s.logf(LevelWarn, "[%s] cleanup: %s", indexable, line)
 	}
-	wp := strings.Join(s.cfg.Target.BaseWP(), " ")
-	s.logf(LevelError,
-		"[%s] could not clear the killed run's leftovers automatically. Clear them by hand, then re-run:\n"+
-			"      %s transient delete ep_wpcli_sync\n"+
-			"      %s option delete ep_index_meta\n"+
-			"      %s site option delete ep_index_meta\n"+
-			"      %s cache delete alloptions options\n"+
-			"      %s cache delete ep_index_meta options",
-		indexable, wp, wp, wp, wp, wp)
 	return false
 }
 
@@ -414,11 +531,11 @@ func (s *Supervisor) reportPersistentLock(ctx context.Context, indexable string,
 	switch {
 	case st != nil && st.Indexing && alreadyCleared:
 		s.logf(LevelError,
-			"[%s] still locked even after clearing a frozen sync — investigate on the platform side (%s get-indexing-status), then re-run.",
+			"[%s] still locked after an idle-state cleanup — investigate on the platform side (%s get-indexing-status), then re-run.",
 			indexable, s.commandHint())
 	case st != nil && st.Indexing:
 		s.logf(LevelError,
-			"[%s] the index lock persists and the platform reports an ACTIVE, advancing index — something else is indexing (a dashboard/cron sync or another CLI). Stop it (`stop` action / %s stop-indexing) or let it finish, then re-run.",
+			"[%s] the index lock persists and the platform reports indexing. Inspect it (%s get-indexing-status); do not clear its state without confirming the worker has stopped.",
 			indexable, s.commandHint())
 	case st != nil:
 		s.logf(LevelError,
@@ -432,11 +549,10 @@ func (s *Supervisor) reportPersistentLock(ctx context.Context, indexable string,
 }
 
 func syncFingerprint(st *vipsearch.IndexingStatus) string {
-	var synced, lastID int64
-	if st.CurrentSync != nil {
-		synced, lastID = st.CurrentSync.Synced, st.CurrentSync.LastObjectID
-	}
-	return fmt.Sprintf("synced %s, last id %s", formatInt(max(synced, st.ItemsIndexed)), formatInt(lastID))
+	// Include sync identity and every counter independently; max(a,b) hides
+	// movement in the smaller counter and changes between phases/workers.
+	data, _ := json.Marshal(st)
+	return string(data)
 }
 
 func syncMethod(st *vipsearch.IndexingStatus) string {
@@ -446,34 +562,26 @@ func syncMethod(st *vipsearch.IndexingStatus) string {
 	return st.Method
 }
 
-// resolveStartCheckpoint picks where indexing resumes from. When building
-// into a separate version, only our own checkpoint is meaningful: the live
-// get-last-indexed-post-id tracks whatever last wrote to the *active* index,
-// and trusting it would skip every object above that ID in a brand new,
-// empty index.
+// Only a local, scoped checkpoint is suitable for automatic resume. The
+// platform's last-post ID is global across CLI versions and post-type filters.
 func (s *Supervisor) resolveStartCheckpoint(ctx context.Context, indexable string, version int) int64 {
+	if s.resumed != nil {
+		for _, p := range s.resumed.Phases {
+			if p.Name == indexable {
+				if p.LastObjectID <= 0 && p.Attempt == 0 {
+					return s.resumed.Config.ResumeFrom
+				}
+				return max(0, p.LastObjectID)
+			}
+		}
+	}
 	if s.cfg.ResumeFrom > 0 {
 		return s.cfg.ResumeFrom
 	}
 	if s.cfg.Strategy == StrategySetup {
 		return 0 // fresh build starts from the top
 	}
-	local := s.store.ReadCheckpoint(indexable, version)
-	if s.cfg.Strategy == StrategyNewVersion || s.cfg.Strategy == StrategyIntoVersion {
-		return local
-	}
-	if indexable != "post" {
-		return local
-	}
-	live := s.client.LastIndexedPostID(ctx)
-	switch {
-	case local > 0 && live > 0:
-		return min(local, live)
-	case live > 0:
-		return live
-	default:
-		return local
-	}
+	return s.store.ReadCheckpoint(indexable, version)
 }
 
 func (s *Supervisor) buildIndexArgs(indexable string, attempt int, checkpoint int64, version int) []string {
@@ -505,15 +613,17 @@ func (s *Supervisor) buildIndexArgs(indexable string, attempt int, checkpoint in
 // -- one attempt ------------------------------------------------------------
 
 type attemptOutcome struct {
-	success   bool
-	lockError bool
-	stalled   bool
-	deadline  bool
-	killed    bool // we ended it, rather than it exiting on its own
-	fatal     string
-	exitErr   error
-	indexed   int64
-	logPath   string
+	success      bool
+	lockError    bool
+	progressed   bool
+	commandError bool
+	stalled      bool
+	deadline     bool
+	killed       bool // we ended it, rather than it exiting on its own
+	fatal        string
+	exitErr      error
+	indexed      int64
+	logPath      string
 }
 
 func (o attemptOutcome) exitNote() string {
@@ -533,22 +643,33 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 
 	full := append(s.cfg.Target.Base(), args...)
 	cmd := exec.Command(full[0], full[1:]...)
-	configureProcessGroup(cmd)
+	childproc.Configure(cmd)
 
-	stdout, err := cmd.StdoutPipe()
-	if err == nil {
-		cmd.Stderr = cmd.Stdout // interleave, same as a terminal would
-		err = cmd.Start()
-	}
+	attemptLog, err := os.OpenFile(outcome.logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
+		outcome.fatal = fmt.Sprintf("could not create attempt log: %v", err)
+		return outcome
+	}
+	defer attemptLog.Close()
+	chunks := make(chan []byte)
+	cmd.Stdout = &chunkWriter{chunks: chunks}
+	cmd.Stderr = cmd.Stdout
+	cmd.WaitDelay = 2 * time.Second
+	if err := cmd.Start(); err != nil {
 		// Retrying cannot conjure a missing binary; report the fatal it is.
 		outcome.fatal = fmt.Sprintf("could not start %q: %v", full[0], err)
 		return outcome
 	}
 
-	// Closed at stdout EOF, i.e. when the whole child tree has let go of the
-	// pipe. Callers use it to stop waiting out a grace period early.
+	// Wait runs concurrently with output draining. EOF alone does not mean
+	// the process exited, and a descendant may keep its output pipe open.
 	gone := make(chan struct{})
+	waited := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		close(gone)
+		waited <- err
+	}()
 
 	s.mu.Lock()
 	s.child = cmd
@@ -561,22 +682,9 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 		s.mu.Unlock()
 	}()
 
-	lines := make(chan string)
-	go func() {
-		defer close(lines)
-		defer close(gone)
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			lines <- scanner.Text()
-		}
-	}()
-
-	attemptLog, _ := os.OpenFile(outcome.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if attemptLog != nil {
-		defer attemptLog.Close()
-	}
-
+	opCtx, cancelOperations := context.WithCancel(ctx)
+	var operations sync.WaitGroup
+	defer func() { cancelOperations(); operations.Wait() }()
 	lastOutput := time.Now()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -585,19 +693,78 @@ func (s *Supervisor) runAttempt(ctx context.Context, indexable string, version i
 	// Set once a shutdown is under way. Without it, ticks that land between
 	// the kill and the pipe reaching EOF would re-run the whole stop sequence.
 	stopping := false
+	stop := func(graceful bool) {
+		if stopping {
+			return
+		}
+		stopping, outcome.killed = true, true
+		operations.Add(1)
+		go func() {
+			defer operations.Done()
+			s.stopChild(opCtx, indexable, cmd, gone, graceful)
+		}()
+	}
+	// Oversized diagnostic lines must not stop the pipe reader. Log every
+	// byte, but cap the memory used to parse any one line.
+	var pending string
+	oversized := false
+	consume := func(fragment string, end bool) {
+		if !oversized {
+			if len(pending)+len(fragment) > 1024*1024 {
+				pending = ""
+				oversized = true
+			} else {
+				pending += fragment
+			}
+		}
+		if end {
+			if !oversized {
+				s.consumeLine(indexable, version, pending, &outcome)
+			}
+			pending, oversized = "", false
+		}
+	}
+	type probeResult struct {
+		advancing bool
+		started   time.Time
+	}
+	probes := make(chan probeResult, 1)
+	probing := false
 
 reading:
 	for {
 		select {
-		case line, open := <-lines:
-			if !open {
-				break reading
-			}
+		case chunk := <-chunks:
 			lastOutput = time.Now()
-			if attemptLog != nil {
-				fmt.Fprintln(attemptLog, line)
+			if _, err := attemptLog.Write(chunk); err != nil {
+				outcome.fatal = fmt.Sprintf("could not write attempt log: %v", err)
 			}
-			s.consumeLine(indexable, version, line, &outcome)
+			parts := strings.Split(string(chunk), "\n")
+			for i, part := range parts {
+				consume(part, i < len(parts)-1)
+			}
+			if outcome.fatal != "" {
+				stop(false)
+			}
+		case err := <-waited:
+			outcome.exitErr = err
+			if errors.Is(err, exec.ErrWaitDelay) {
+				childproc.Terminate(cmd, 0, gone)
+			}
+			consume("", true)
+			break reading
+		case probe := <-probes:
+			probing = false
+			if stopping || lastOutput.After(probe.started) {
+				continue
+			}
+			if probe.advancing {
+				lastOutput = time.Now()
+			} else {
+				s.logf(LevelWarn, "[%s] no output for %s and remote progress could not be confirmed; stopping the local attempt (remote state will not be erased)", indexable, s.cfg.StallTimeout)
+				outcome.stalled = true
+				stop(false) // no ownership proof for a global stop-indexing request
+			}
 		case <-ticker.C:
 			if stopping {
 				s.emitProgress()
@@ -605,48 +772,43 @@ reading:
 			}
 			switch {
 			case s.stopRequested():
-				stopping = true
-				s.stopChild(ctx, indexable, cmd, gone, !s.forceRequested())
-				outcome.killed = true
+				stop(!s.forceRequested())
 			case s.pastDeadline():
-				stopping = true
 				s.logf(LevelWarn, "[%s] time budget exhausted — stopping the running index", indexable)
-				s.stopChild(ctx, indexable, cmd, gone, true)
 				outcome.deadline = true
-				outcome.killed = true
-			case time.Since(lastOutput) > s.cfg.StallTimeout:
-				if s.remoteIsAdvancing(ctx, indexable, &lastStallProbe) {
-					// Silent stdout but the platform is still making
-					// progress: killing here is what manufactures a wedged
-					// index and an orphaned sync record. Keep waiting.
-					lastOutput = time.Now()
-					break
-				}
-				s.logf(LevelWarn, "[%s] no output for %s and the platform reports no progress — stopping the stalled run",
-					indexable, s.cfg.StallTimeout)
-				stopping = true
-				s.stopChild(ctx, indexable, cmd, gone, true)
-				outcome.stalled = true
-				outcome.killed = true
+				stop(true)
+			case !probing && time.Since(lastOutput) > s.cfg.StallTimeout:
+				probing = true
+				started := time.Now()
+				operations.Add(1)
+				go func() {
+					defer operations.Done()
+					probes <- probeResult{s.remoteIsAdvancing(opCtx, indexable, &lastStallProbe), started}
+				}()
 			}
 			s.emitProgress()
 		case <-ctxDone:
-			terminateProcessTree(cmd, 0, gone)
-			outcome.killed = true
+			childproc.Terminate(cmd, 0, gone)
+			stopping, outcome.killed = true, true
+			outcome.deadline = ctx.Err() == context.DeadlineExceeded
 			ctxDone = nil // fires once; a closed channel would spin this loop
 		}
 	}
 
-	outcome.exitErr = cmd.Wait()
-	if outcome.success {
-		outcome.exitErr = nil
-		return outcome
+	outcome.success = outcome.success && outcome.exitErr == nil && !outcome.killed && outcome.fatal == "" && !outcome.commandError
+	if !outcome.success {
+		s.logf(LevelWarn, "[%s] attempt ended (%s); raw output: %s", indexable, outcome.exitNote(), outcome.logPath)
 	}
-	// An attempt that did not finish cannot delete its own sync record, and
-	// whatever it left behind blocks the next attempt (and the next phase)
-	// with "an index is already occurring".
-	s.cleanupAfterFailedAttempt(ctx, indexable)
+	// Local CLI exit does not prove that the remote worker exited, nor that
+	// a remaining CLI sync record belongs to us. Never erase it here.
 	return outcome
+}
+
+type chunkWriter struct{ chunks chan<- []byte }
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	w.chunks <- append([]byte(nil), p...)
+	return len(p), nil
 }
 
 // stopChild ends the running attempt. When `graceful`, the platform is asked
@@ -655,17 +817,28 @@ reading:
 // a killed run leaves debris that blocks everything after it.
 func (s *Supervisor) stopChild(ctx context.Context, indexable string, cmd *exec.Cmd, gone <-chan struct{}, graceful bool) {
 	if !graceful {
-		terminateProcessTree(cmd, 0, gone)
+		childproc.Terminate(cmd, 0, gone)
 		return
 	}
+	select {
+	case <-gone:
+		return
+	default:
+	}
 	s.setStatusNote("asking the platform to stop indexing")
-	s.client.StopIndexing(ctx)
+	// This command runs alongside the output reader and any status probe;
+	// use an independent client so LastRun is never shared concurrently.
+	res := vipsearch.NewClient(s.cfg.Target).StopIndexing(ctx)
+	if !res.Succeeded() && ctx.Err() == nil {
+		s.logf(LevelWarn, "[%s] platform stop was not confirmed: %s", indexable, strings.Join(res.DescribeFailure(), "; "))
+	}
 	select {
 	case <-gone: // it wound down on its own; nothing to kill
 		return
 	case <-time.After(remoteStopGrace):
+	case <-ctx.Done():
 	}
-	terminateProcessTree(cmd, 2*time.Second, gone)
+	childproc.Terminate(cmd, 2*time.Second, gone)
 }
 
 // remoteStopGrace is how long a `stop-indexing` request is given to take
@@ -678,7 +851,7 @@ const remoteStopGrace = 20 * time.Second
 // VIP-CLI buffers, and a long batch prints nothing — so the platform gets a
 // say before anything is killed.
 func (s *Supervisor) remoteIsAdvancing(ctx context.Context, indexable string, previous *string) bool {
-	st := s.client.Status(ctx)
+	st := vipsearch.NewClient(s.cfg.Target).Status(ctx)
 	if st == nil || !st.Indexing {
 		return false // cannot confirm progress; treat as stalled
 	}
@@ -701,48 +874,42 @@ func (s *Supervisor) remoteIsAdvancing(ctx context.Context, indexable string, pr
 	return advanced
 }
 
-// cleanupAfterFailedAttempt clears the sync record a dead attempt left behind.
-// A dashboard/cron sync is left alone: only a CLI record can be ours, and ours
-// is the one that just died.
-func (s *Supervisor) cleanupAfterFailedAttempt(ctx context.Context, indexable string) {
-	st := s.client.Status(ctx)
-	if st == nil || !st.Indexing {
-		return // nothing left behind
-	}
-	if st.Method != "" && st.Method != "cli" {
-		s.logf(LevelWarn, "[%s] a %s sync is registered as running — leaving it alone", indexable, st.Method)
-		return
-	}
-	s.logf(LevelInfo, "[%s] clearing the sync record left by the attempt that just died", indexable)
-	s.client.ClearSyncRecord(ctx)
-	s.client.ClearIndexLock(ctx)
-}
-
 func (s *Supervisor) consumeLine(indexable string, version int, line string, outcome *attemptOutcome) {
 	// The raw (still colourised) line has already been written to the attempt
 	// log; parse a stripped copy, or the escape codes VIP-CLI embeds around
 	// "Success:" would hide the completion marker — the exact bug that made
 	// the predecessor script abort runs that had in fact finished.
 	line = vipsearch.StripANSI(line)
-	if strings.Contains(strings.ToLower(line), vipsearch.LockErrorMarker) {
+	if vipsearch.IsLockError(line) {
 		outcome.lockError = true
 	} else if outcome.fatal == "" {
 		// A stale lock is retryable and has its own handling, so it must
 		// never be classified as fatal.
 		outcome.fatal = vipsearch.ClassifyFatal(line)
 	}
-	if strings.Contains(line, vipsearch.SuccessMarker) {
+	if (vipsearch.RunResult{Output: line}).Failed() {
+		outcome.commandError = true
+	}
+	if vipsearch.IsIndexSuccess(line) {
 		outcome.success = true
 	}
 
 	p := vipsearch.ParseProgress(line)
+	if p.Done > 0 || p.LastObjectID > 0 {
+		outcome.progressed = true
+	}
 	if p.IndexedCount != vipsearch.NoValue {
 		outcome.indexed = p.IndexedCount
 	}
-	s.applyProgress(indexable, version, p)
+	if err := s.applyProgress(indexable, version, p); err != nil {
+		outcome.fatal = fmt.Sprintf("could not persist checkpoint: %v", err)
+	}
 }
 
-func (s *Supervisor) applyProgress(indexable string, version int, p vipsearch.Progress) {
+func (s *Supervisor) applyProgress(indexable string, version int, p vipsearch.Progress) error {
+	if p.Done == vipsearch.NoValue && p.Total == vipsearch.NoValue && p.LastObjectID == vipsearch.NoValue {
+		return nil // diagnostic output must not flood the UI event queue
+	}
 	s.mu.Lock()
 	ph := &s.phases[s.current]
 	if p.Total != vipsearch.NoValue {
@@ -768,11 +935,11 @@ func (s *Supervisor) applyProgress(indexable string, version int, p vipsearch.Pr
 		}
 	}
 	checkpointID := int64(0)
-	if p.LastObjectID != vipsearch.NoValue {
+	if p.LastObjectID > 0 {
 		if ph.LastObjectID == vipsearch.NoValue || p.LastObjectID < ph.LastObjectID {
 			checkpointID = p.LastObjectID
+			ph.LastObjectID = p.LastObjectID
 		}
-		ph.LastObjectID = p.LastObjectID
 	}
 	s.mu.Unlock()
 
@@ -780,9 +947,15 @@ func (s *Supervisor) applyProgress(indexable string, version int, p vipsearch.Pr
 	// strictly lower ID — overlap on resume is a harmless upsert, skipping
 	// is not.
 	if checkpointID > 0 {
-		s.store.WriteCheckpoint(indexable, version, checkpointID)
+		if err := s.store.WriteCheckpoint(indexable, version, checkpointID); err != nil {
+			return err
+		}
+	}
+	if err := s.progressMilestones(); err != nil {
+		return err
 	}
 	s.emitProgress()
+	return nil
 }
 
 // -- state bookkeeping ------------------------------------------------------
@@ -805,6 +978,8 @@ func (s *Supervisor) nextAttempt() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.phases[s.current].Attempt++
+	s.attemptDone, s.attemptTotal = vipsearch.NoValue, vipsearch.NoValue
+	s.samples = nil
 	return s.phases[s.current].Attempt
 }
 
@@ -857,6 +1032,7 @@ func (s *Supervisor) emitProgress() {
 }
 
 func (s *Supervisor) rateLocked() float64 {
+	s.trimSamplesLocked()
 	if len(s.samples) < 2 {
 		return 0
 	}
@@ -894,7 +1070,7 @@ func (s *Supervisor) sleep(ctx context.Context, d time.Duration) bool {
 		}
 		s.emitProgress()
 	}
-	return !s.stopRequested() && !s.pastDeadline()
+	return ctx.Err() == nil && !s.stopRequested() && !s.pastDeadline()
 }
 
 // -- logging ----------------------------------------------------------------
@@ -949,13 +1125,13 @@ func cleanOldAttemptLogs(logDir string) int {
 }
 
 func (s *Supervisor) attemptLogPath(indexable string) string {
-	stamp := time.Now().Format("20060102-150405")
+	stamp := time.Now().Format("20060102-150405.000000000")
 	return filepath.Join(s.cfg.StateDir, "logs", fmt.Sprintf("attempt-%s-%s.log", indexable, stamp))
 }
 
 func (s *Supervisor) logAttemptStart(indexable string, attempt int, checkpoint int64, args []string) {
 	resumeNote := "from top"
-	if s.cfg.Strategy == StrategySetup && attempt == 1 {
+	if containsSetup(args) {
 		resumeNote = "--setup (fresh)"
 	} else if checkpoint > 0 {
 		resumeNote = "from id " + formatInt(checkpoint)
@@ -965,6 +1141,15 @@ func (s *Supervisor) logAttemptStart(indexable string, attempt int, checkpoint i
 	s.logf(LevelInfo, "[%s] attempt %d (%s): %s", indexable, attempt, resumeNote, strings.Join(full, " "))
 }
 
+func containsSetup(args []string) bool {
+	for _, arg := range args {
+		if arg == "--setup" {
+			return true
+		}
+	}
+	return false
+}
+
 // logf writes to the master log, the JSONL stream, and the UI. The JSONL
 // stream carries the phase metrics alongside each event so run history stays
 // queryable (`jq` over events.jsonl) without a database; append-only means a
@@ -972,6 +1157,12 @@ func (s *Supervisor) logAttemptStart(indexable string, attempt int, checkpoint i
 func (s *Supervisor) logf(level Level, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	now := time.Now()
+	if level == LevelError && s.history != nil {
+		s.history.LastError = msg
+		if len(s.history.LastError) > 4096 {
+			s.history.LastError = s.history.LastError[:4096]
+		}
+	}
 
 	if s.logFile != nil {
 		// Go layout string: the reference time "2006-01-02 15:04:05-0700"

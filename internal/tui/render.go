@@ -26,7 +26,7 @@ func renderStatus(st *vipsearch.IndexingStatus) string {
 
 	cur := st.CurrentSync
 	if cur == nil {
-		cur = &vipsearch.SyncItem{}
+		cur = &vipsearch.SyncItem{Synced: vipsearch.NoValue}
 	}
 	indexable := cur.Indexable
 	if indexable == "" {
@@ -41,7 +41,7 @@ func renderStatus(st *vipsearch.IndexingStatus) string {
 
 	total := firstPositive(cur.Total, st.TotalItems)
 	synced := firstNonNegative(cur.Synced, st.ItemsIndexed)
-	if total > 0 {
+	if total > 0 && synced >= 0 {
 		frac := float64(synced) / float64(total)
 		b.WriteString("  progress       " + progressBar(frac, 30) + fmt.Sprintf(" %5.1f%%\n", frac*100))
 		b.WriteString(fmt.Sprintf("  objects        %s / %s\n", groupInt(synced), groupInt(total)))
@@ -117,8 +117,10 @@ func renderCounts(report vipsearch.CountReport) string {
 	b.WriteString(styleHeading.Render("DB vs ES document counts") + "\n")
 
 	if report.Failed {
-		b.WriteString(styleErr.Render("  the validate-counts command could not run") + "\n")
-		return b.String()
+		b.WriteString(styleErr.Render("  validate-counts failed; any results below may be incomplete") + "\n")
+		for _, line := range lastLines(report.Raw, 6) {
+			b.WriteString(styleDim.Render("    "+line) + "\n")
+		}
 	}
 	if report.ESFailures > 0 {
 		b.WriteString(styleWarn.Render(fmt.Sprintf("  ⚠ %d 'failure querying ES' warning(s)", report.ESFailures)) + "\n")
@@ -215,7 +217,7 @@ func renderInfo(ctx context.Context, client *vipsearch.Client) string {
 		b.WriteString(renderStatusUnavailable(client))
 	}
 
-	b.WriteString("\n" + styleHeading.Render("Resume point") + "\n")
+	b.WriteString("\n" + styleHeading.Render("Platform CLI progress (not a scoped resume point)") + "\n")
 	if last := client.LastIndexedPostID(ctx); last > 0 {
 		b.WriteString("  last indexed post id  " + styleAccent.Render(groupInt(last)) + "\n")
 	} else {

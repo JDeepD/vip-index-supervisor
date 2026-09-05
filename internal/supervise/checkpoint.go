@@ -1,10 +1,10 @@
 package supervise
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -23,14 +23,13 @@ type checkpointStore struct {
 	postTypes string
 }
 
-var reScopeUnsafe = regexp.MustCompile(`[^\w-]+`)
-
 func (s checkpointStore) scopeKey(indexable string, version int) string {
 	parts := []string{indexable}
 	if indexable == "post" && s.postTypes != "" {
-		if slug := strings.Trim(reScopeUnsafe.ReplaceAllString(s.postTypes, "_"), "_"); slug != "" {
-			parts = append(parts, slug)
-		}
+		// A lossy slug aliases filters such as "news,page" and "news_page".
+		// Do not inherit old slug-only checkpoints: replaying is safe, skipping isn't.
+		digest := sha256.Sum256([]byte(s.postTypes))
+		parts = append(parts, fmt.Sprintf("types-%x", digest[:8]))
 	}
 	if version > 0 {
 		parts = append(parts, fmt.Sprintf("v%d", version))
@@ -55,8 +54,8 @@ func (s checkpointStore) WriteCheckpoint(indexable string, version int, id int64
 	return writeIntAtomic(s.checkpointPath(indexable, version), id)
 }
 
-func (s checkpointStore) ClearCheckpoint(indexable string, version int) {
-	os.Remove(s.checkpointPath(indexable, version))
+func (s checkpointStore) ClearCheckpoint(indexable string, version int) error {
+	return removeStateFile(s.checkpointPath(indexable, version))
 }
 
 // PinnedVersion is the index version a previous run was building into, or 0.
@@ -68,8 +67,16 @@ func (s checkpointStore) PinVersion(indexable string, version int) error {
 	return writeIntAtomic(s.versionPath(indexable), int64(version))
 }
 
-func (s checkpointStore) UnpinVersion(indexable string) {
-	os.Remove(s.versionPath(indexable))
+func (s checkpointStore) UnpinVersion(indexable string) error {
+	return removeStateFile(s.versionPath(indexable))
+}
+
+func removeStateFile(path string) error {
+	err := os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 func readPositiveInt(path string) int64 {
@@ -105,5 +112,9 @@ func writeIntAtomic(path string, value int64) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

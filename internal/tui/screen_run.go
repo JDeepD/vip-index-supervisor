@@ -153,6 +153,12 @@ func (s *runScreen) refreshLog() {
 func (s *runScreen) handleKey(key tea.KeyMsg) (Screen, tea.Cmd) {
 	if s.done {
 		switch key.String() {
+		case "r":
+			if id := s.sup.SavedRunID(); id != "" {
+				sess := newSession()
+				sess.target, sess.notifications = s.cfg.Target, s.cfg.Notifications
+				return s, push(newRecoveryScreen(sess, s.cfg.StateDir, id))
+			}
 		case "q", "ctrl+c":
 			return s, tea.Quit
 		case "enter", "esc":
@@ -281,7 +287,7 @@ func (s *runScreen) renderLog() string {
 
 func (s *runScreen) helpView() string {
 	if s.done {
-		return styleHelp.Render("↑/↓ scroll log · enter/esc back · q quit")
+		return styleHelp.Render("↑/↓ scroll log · r recovery & saved run · enter/esc back · q quit")
 	}
 	if s.stops > 0 {
 		return styleHelp.Render("ctrl+c again to force-kill")

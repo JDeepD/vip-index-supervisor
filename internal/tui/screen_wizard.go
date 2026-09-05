@@ -66,7 +66,7 @@ func newEnvInputScreen() *inputScreen {
 		return ""
 	}
 	in.submit = func(v string) tea.Cmd {
-		sess := newSession()
+		sess := newConfiguredSession()
 		sess.target.AppEnv = v
 		return push(newActionScreen(sess))
 	}
@@ -83,7 +83,7 @@ func newWPInputScreen() *inputScreen {
 		return ""
 	}
 	in.submit = func(v string) tea.Cmd {
-		sess := newSession()
+		sess := newConfiguredSession()
 		sess.target.WPCommand = v
 		return push(newActionScreen(sess))
 	}
@@ -95,11 +95,13 @@ func newWPInputScreen() *inputScreen {
 type actionScreen struct {
 	sess *session
 	menu *Menu
+	rows int
 }
 
 func newActionScreen(sess *session) *actionScreen {
-	return &actionScreen{sess: sess, menu: NewMenu([]MenuItem{
+	return &actionScreen{sess: sess, rows: 6, menu: NewMenu([]MenuItem{
 		{Value: "index", Label: "index", Desc: "run or resume supervised indexing"},
+		{Value: "history", Label: "history / recovery", Desc: "inspect saved runs and safely resume an interrupted run"},
 		{Value: "info", Label: "info", Desc: "versions + status + resume point"},
 		{Value: "status", Label: "status", Desc: "current indexing progress, one shot"},
 		{Value: "watch", Label: "watch", Desc: "poll status until indexing goes idle"},
@@ -108,11 +110,17 @@ func newActionScreen(sess *session) *actionScreen {
 		{Value: "versions", Label: "versions", Desc: "browse versions: activate, delete, or build into one"},
 		{Value: "unlock", Label: "unlock", Desc: "clear a stale index lock (delete-transient)"},
 		{Value: "stop", Label: "stop", Desc: "ask a running index to stop"},
+		{Value: "notifications", Label: "notifications", Desc: "configure ntfy phone alerts and send a test"},
 	})}
 }
 
 func (s *actionScreen) Title() string { return s.sess.target.Label() }
 func (s *actionScreen) Init() tea.Cmd { return nil }
+func (s *actionScreen) SetSize(w, h int) {
+	if h > 0 {
+		s.rows = max(1, (h-12)/2)
+	}
+}
 
 func (s *actionScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	key, ok := msg.(tea.KeyMsg)
@@ -126,6 +134,8 @@ func (s *actionScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		return s, nil
 	}
 	switch s.menu.Selected().Value {
+	case "history":
+		return s, push(newHistoryScreen(s.sess))
 	case "index":
 		return s, push(newIndexablesScreen(s.sess))
 	case "versions":
@@ -134,14 +144,21 @@ func (s *actionScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		return s, push(newWatchScreen(s.sess))
 	case "unlock":
 		return s, push(newUnlockScreen(s.sess))
+	case "notifications":
+		return s, push(newNotificationsScreen(s.sess))
 	default:
 		return s, push(newOutputScreen(s.sess, s.menu.Selected().Value))
 	}
 }
 
 func (s *actionScreen) View() string {
+	note := ""
+	if s.sess.notificationLoadError != "" {
+		note = styleWarn.Render(s.sess.notificationLoadError) + "\n\n"
+	}
 	return styleHeading.Render("What do you want to do?") + "\n\n" +
-		s.menu.View() +
+		note +
+		s.menu.ViewWindow(s.rows) +
 		styleHelp.Render("↑/↓ move · enter select · esc back · q quit")
 }
 
@@ -271,9 +288,9 @@ func newOptionsScreen(sess *session) *optionsScreen {
 		fields: []formField{
 			{label: "Objects per cycle (1–5000)", kind: kindText, text: strconv.Itoa(sess.perPage)},
 			{label: "Show verbose indexer errors", kind: kindToggle, on: sess.showErrors},
-			{label: "Wall-clock budget (e.g. 90m, 6h)", kind: kindText, placeholder: "unlimited"},
+			{label: "Wall-clock budget (e.g. 90m, 6h)", kind: kindText, text: textIfDuration(sess.maxDuration), placeholder: "unlimited"},
 		},
-		actions: []string{"Continue ▶", "Advanced ▸"},
+		actions: []string{"Continue ▶", "Advanced ▸", "Notifications ▸"},
 	}}
 }
 
@@ -295,6 +312,9 @@ func (s *optionsScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	}
 	if action == "Advanced ▸" {
 		return s, push(newAdvancedScreen(s.sess))
+	}
+	if action == "Notifications ▸" {
+		return s, push(newNotificationsScreen(s.sess))
 	}
 	return s, push(newConfirmScreen(s.sess))
 }
@@ -350,7 +370,7 @@ func newAdvancedScreen(sess *session) *advancedScreen {
 	return &advancedScreen{sess: sess, form: &form{
 		fields: []formField{
 			{label: "Resume from object ID", kind: kindText,
-				text: textIfPositive(sess.resumeFrom), placeholder: "auto (checkpoint / live resume point)"},
+				text: textIfPositive(sess.resumeFrom), placeholder: "auto (scoped local checkpoint)"},
 			{label: "State directory", kind: kindText,
 				text: sess.stateDir, placeholder: "default: ~/.vip-reindex/<target>"},
 			{label: "Stall timeout (e.g. 10m)", kind: kindText,
@@ -534,6 +554,15 @@ func (s *confirmScreen) View() string {
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("  strategy     %s\n", s.sess.strategy))
 	b.WriteString(fmt.Sprintf("  state dir    %s\n", cfg.StateDir))
+	if cfg.Notifications.Endpoint != "" {
+		b.WriteString("  ntfy alerts  enabled (start, 25/50/75/100% per phase, final result")
+		if cfg.Notifications.RetryAlerts {
+			b.WriteString(", retries")
+		}
+		b.WriteString(")\n")
+	} else {
+		b.WriteString("  ntfy alerts  off — configure from Options → Notifications\n")
+	}
 	if cfg.MaxDuration > 0 {
 		b.WriteString(fmt.Sprintf("  time budget  %s (stops at a checkpoint; a re-run resumes)\n", cfg.MaxDuration))
 	}

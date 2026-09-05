@@ -1,10 +1,13 @@
 package tui
 
 import (
+	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jdeepd/vip-index-supervisor/internal/notify"
 	"github.com/jdeepd/vip-index-supervisor/internal/supervise"
 	"github.com/jdeepd/vip-index-supervisor/internal/vipsearch"
 )
@@ -15,13 +18,15 @@ import (
 type session struct {
 	target vipsearch.Target
 
-	indexables  []string
-	postTypes   string
-	strategy    supervise.Strategy
-	intoVersion int // set when strategy is StrategyIntoVersion
-	perPage     int
-	showErrors  bool
-	maxDuration time.Duration
+	indexables            []string
+	postTypes             string
+	strategy              supervise.Strategy
+	intoVersion           int // set when strategy is StrategyIntoVersion
+	perPage               int
+	showErrors            bool
+	maxDuration           time.Duration
+	notifications         notify.Config
+	notificationLoadError string
 
 	// advanced options; zero values mean "use the defaults"
 	resumeFrom   int64
@@ -31,25 +36,40 @@ type session struct {
 }
 
 func newSession() *session {
-	return &session{indexables: []string{"post"}, perPage: 350}
+	return &session{indexables: []string{"post"}, perPage: 350, notifications: notify.Config{RetryAlerts: true}}
+}
+
+// Disk-backed preferences are loaded only when the user creates a session,
+// not by the supervisor or tests constructing a plain session.
+func newConfiguredSession() *session {
+	s := newSession()
+	path, err := notify.SettingsPath()
+	if err == nil {
+		s.notifications, err = notify.Load(path)
+	}
+	if err != nil {
+		s.notificationLoadError = "Saved notification settings could not be loaded; notifications are off. Open notifications to configure them."
+	}
+	return s
 }
 
 func (s *session) client() *vipsearch.Client { return vipsearch.NewClient(s.target) }
 
 func (s *session) config() supervise.Config {
 	cfg := supervise.Config{
-		Target:       s.target,
-		Indexables:   s.indexables,
-		PostTypes:    s.postTypes,
-		PerPage:      s.perPage,
-		Strategy:     s.strategy,
-		IntoVersion:  s.intoVersion,
-		ResumeFrom:   s.resumeFrom,
-		ShowErrors:   s.showErrors,
-		MaxDuration:  s.maxDuration,
-		StateDir:     s.stateDir,
-		StallTimeout: s.stallTimeout,
-		IgnoreLock:   s.ignoreLock,
+		Target:        s.target,
+		Indexables:    s.indexables,
+		PostTypes:     s.postTypes,
+		PerPage:       s.perPage,
+		Strategy:      s.strategy,
+		IntoVersion:   s.intoVersion,
+		ResumeFrom:    s.resumeFrom,
+		ShowErrors:    s.showErrors,
+		MaxDuration:   s.maxDuration,
+		StateDir:      s.stateDir,
+		StallTimeout:  s.stallTimeout,
+		IgnoreLock:    s.ignoreLock,
+		Notifications: s.notifications,
 	}
 	cfg.Normalize()
 	return cfg
@@ -89,7 +109,14 @@ func parseBudget(text string) (time.Duration, error) {
 		return 0, nil
 	}
 	if secs, err := strconv.Atoi(text); err == nil {
+		if secs < 0 || int64(secs) > math.MaxInt64/int64(time.Second) {
+			return 0, fmt.Errorf("time budget is negative or too large")
+		}
 		return time.Duration(secs) * time.Second, nil
 	}
-	return time.ParseDuration(text)
+	duration, err := time.ParseDuration(text)
+	if err == nil && duration < 0 {
+		err = fmt.Errorf("time budget cannot be negative")
+	}
+	return duration, err
 }

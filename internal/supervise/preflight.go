@@ -23,11 +23,17 @@ var reIndexableMissing = regexp.MustCompile(`(?i)Indexable\s+\w+\s+not found`)
 // have already committed their index versions.
 func (s *Supervisor) preflight(ctx context.Context) []string {
 	var problems []string
-	for _, indexable := range s.cfg.Indexables {
+	for i, indexable := range s.cfg.Indexables {
+		if s.phases[i].Status == PhaseComplete {
+			continue
+		}
+		if ctx.Err() != nil || s.stopRequested() {
+			return []string{"cancelled"}
+		}
 		if len(s.client.Versions(ctx, indexable)) > 0 {
 			continue
 		}
-		if reIndexableMissing.MatchString(s.client.LastRun.Output) {
+		if reIndexableMissing.MatchString(s.client.LastResult().Output) {
 			msg := fmt.Sprintf("'%s' is not a registered indexable", indexable)
 			if feature := featureForIndexable[indexable]; feature != "" {
 				msg += fmt.Sprintf(" — enable it first: %s activate-feature %s",
@@ -36,7 +42,7 @@ func (s *Supervisor) preflight(ctx context.Context) []string {
 			problems = append(problems, msg)
 			continue
 		}
-		lines := s.client.LastRun.DescribeFailure()
+		lines := s.client.LastResult().DescribeFailure()
 		problems = append(problems, fmt.Sprintf(
 			"could not read index versions for '%s': %s", indexable, lines[len(lines)-1]))
 	}

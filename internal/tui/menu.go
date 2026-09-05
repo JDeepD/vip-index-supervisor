@@ -48,8 +48,16 @@ func (m *Menu) Update(msg tea.KeyMsg) (chosen bool) {
 func (m *Menu) Selected() MenuItem { return m.Items[m.cursor] }
 
 func (m *Menu) View() string {
+	return m.ViewWindow(len(m.Items))
+}
+
+// ViewWindow keeps the selected action visible in a short terminal.
+func (m *Menu) ViewWindow(rows int) string {
 	var b strings.Builder
-	for i, item := range m.Items {
+	rows = max(1, rows)
+	start := max(0, m.cursor-rows+1)
+	for i := start; i < min(len(m.Items), start+rows); i++ {
+		item := m.Items[i]
 		cursor, label := "  ", item.Label
 		if i == m.cursor {
 			cursor = styleCursor.Render("❯ ")

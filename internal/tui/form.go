@@ -19,6 +19,7 @@ type formField struct {
 	text        string
 	placeholder string // shown dimmed when a text field is empty
 	on          bool
+	secret      bool // hide access tokens in the rendered form
 }
 
 // form is a column of editable fields followed by action rows, under one
@@ -78,6 +79,10 @@ func (f *form) Update(key tea.KeyMsg) string {
 			runes := []rune(fld.text)
 			fld.text = string(runes[:len(runes)-1])
 		}
+	case "ctrl+u":
+		if fld := f.focusedField(); fld != nil && fld.kind == kindText {
+			fld.text = ""
+		}
 	default:
 		// KeyRunes may carry several runes at once — fast typing and pastes
 		// arrive batched — so append them all, not just single keystrokes.
@@ -110,6 +115,9 @@ func (f *form) fieldRow(i int) string {
 	focused := f.cursor == i
 
 	value := fld.text
+	if fld.secret && value != "" {
+		value = "[hidden]"
+	}
 	switch {
 	case fld.kind == kindToggle && fld.on:
 		value = styleOK.Render("on")
