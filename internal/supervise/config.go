@@ -76,6 +76,9 @@ type Config struct {
 	VerifyAttempts   int
 	VerifyDelay      time.Duration
 	IgnoreLock       bool
+	// AggressiveRecovery explicitly accepts the risk of clearing an apparently
+	// frozen CLI sync whose remote process cannot be proven dead. Off by default.
+	AggressiveRecovery bool
 }
 
 // Normalize fills defaults and derives the state directory from the target,
@@ -126,6 +129,9 @@ func (c *Config) Normalize() {
 }
 
 func (c Config) Validate() error {
+	if c.AggressiveRecovery && c.IgnoreLock {
+		return fmt.Errorf("aggressive recovery requires the local state-directory lock")
+	}
 	if c.ResumeRunID != "" && !validRunID(c.ResumeRunID) {
 		return fmt.Errorf("invalid saved run ID")
 	}

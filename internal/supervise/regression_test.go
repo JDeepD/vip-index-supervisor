@@ -22,10 +22,19 @@ type fakeSearch struct {
 	statuses                  []*vipsearch.IndexingStatus
 	add                       vipsearch.RunResult
 	clears, adds, activations int
+	statusCalls, syncClears   int
+	onStatus                  func()
+	onClear                   func()
+	onSyncClear               func()
+	clearResult, syncResult   *vipsearch.RunResult
 }
 
 func (f *fakeSearch) Versions(context.Context, string) []vipsearch.IndexVersion { return f.rows }
 func (f *fakeSearch) Status(context.Context) *vipsearch.IndexingStatus {
+	f.statusCalls++
+	if f.onStatus != nil {
+		f.onStatus()
+	}
 	if len(f.statuses) == 0 {
 		return nil
 	}
@@ -42,7 +51,28 @@ func (f *fakeSearch) ActivateVersion(context.Context, string, int) vipsearch.Run
 }
 func (f *fakeSearch) ClearIndexLock(context.Context) vipsearch.RunResult {
 	f.clears++
+	if f.onClear != nil {
+		f.onClear()
+	}
+	if f.clearResult != nil {
+		return *f.clearResult
+	}
 	return vipsearch.RunResult{Output: "Success: Index cleared."}
+}
+func (f *fakeSearch) ClearSyncRecordGuarded(ctx context.Context, guard func(context.Context) error) vipsearch.RunResult {
+	for range 6 {
+		if err := guard(ctx); err != nil {
+			return vipsearch.RunResult{Err: err}
+		}
+		f.syncClears++
+		if f.onSyncClear != nil {
+			f.onSyncClear()
+		}
+		if f.syncResult != nil && f.syncResult.Failed() {
+			return *f.syncResult
+		}
+	}
+	return vipsearch.RunResult{Output: "Success: Deleted."}
 }
 func (f *fakeSearch) StopIndexing(context.Context) vipsearch.RunResult {
 	return vipsearch.RunResult{Output: "Success: Stop requested."}
@@ -54,7 +84,7 @@ func (f *fakeSearch) LastResult() vipsearch.RunResult {
 func testSupervisor(t *testing.T) *Supervisor {
 	t.Helper()
 	s := New(Config{StateDir: t.TempDir(), Indexables: []string{"post"}})
-	s.client = &fakeSearch{rows: []vipsearch.IndexVersion{{Number: 1, Active: true, Documents: 1000}, {Number: 2, Documents: 1000}}}
+	s.client = &fakeSearch{rows: []vipsearch.IndexVersion{{Number: 1, Active: true, Documents: 1000}, {Number: 2, Documents: 1000}}, statuses: []*vipsearch.IndexingStatus{{Indexing: false}}}
 	s.wait = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil && !s.stopRequested() }
 	s.beginPhase(0)
 	return s
@@ -147,12 +177,15 @@ func TestProgressResetsLockSequence(t *testing.T) {
 		}
 	}
 	s.runPhase(context.Background(), "post")
-	want := []time.Duration{10 * time.Second, 30 * time.Second, s.cfg.BackoffBase, 10 * time.Second}
+	var want []time.Duration
+	for range 4 {
+		want = append(want, syncFreezeProbeDelay, s.cfg.BackoffBase)
+	}
 	if !reflect.DeepEqual(waits, want) {
 		t.Fatalf("lock errors accumulated across real progress: %v", waits)
 	}
-	if s.client.(*fakeSearch).clears != 0 {
-		t.Fatal("state cleared before diagnosis")
+	if s.client.(*fakeSearch).clears != 4 {
+		t.Fatal("idle lock refusals were not recovered individually")
 	}
 }
 
@@ -187,8 +220,11 @@ func TestThreeProgressingLockFailuresResumeFourthAttempt(t *testing.T) {
 	if !s.runPhase(context.Background(), "post") || i != 4 {
 		t.Fatalf("three progressing failures prevented fourth resume: %d attempts", i)
 	}
-	want := []time.Duration{s.cfg.BackoffBase, s.cfg.BackoffBase, s.cfg.BackoffBase}
-	if !reflect.DeepEqual(waits, want) || s.client.(*fakeSearch).clears != 0 {
+	var want []time.Duration
+	for range 3 {
+		want = append(want, syncFreezeProbeDelay, s.cfg.BackoffBase)
+	}
+	if !reflect.DeepEqual(waits, want) || s.client.(*fakeSearch).clears != 3 {
 		t.Fatalf("progressing attempts treated as persistent startup lock: waits=%v, clears=%d", waits, s.client.(*fakeSearch).clears)
 	}
 }
@@ -209,7 +245,7 @@ func TestBlockingSyncNeverClearedFromInactivityAlone(t *testing.T) {
 			s := testSupervisor(t)
 			f := s.client.(*fakeSearch)
 			f.statuses = tc.statuses
-			cleared, _ := s.diagnoseBlockingSync(context.Background(), "post")
+			cleared := s.recoverCycle(context.Background(), "post", 1, true) == recoveryReady
 			if cleared != tc.wantClear || (f.clears > 0) != tc.wantClear {
 				t.Fatalf("cleared=%v calls=%d", cleared, f.clears)
 			}
@@ -351,6 +387,7 @@ func TestConfigValidationAndLocalStateScope(t *testing.T) {
 		{ResumeFrom: 50, Strategy: StrategySetup}, {ResumeFrom: 50, Indexables: []string{"post", "user"}},
 		{Indexables: []string{"../post"}}, {Indexables: []string{"post", "post"}}, {MaxDuration: -time.Second},
 		{Strategy: StrategyIntoVersion},
+		{AggressiveRecovery: true, IgnoreLock: true},
 	} {
 		cfg.Normalize()
 		if cfg.Validate() == nil {
@@ -521,6 +558,12 @@ func TestIndexHelper(t *testing.T) {
 	}
 	fmt.Println("Warning: acf was called incorrectly in /plugins/acf.php on line 403\nStack trace:\n#0 callback([broken])\n#1 {main}")
 	fmt.Println("Processed 300/1000. Last Object ID: 700")
+	if mode == "memory" {
+		fmt.Println("\x1b[32mMemory Usage:\x1b[0m 171.99mb (Peak: 173.43mb)")
+		fmt.Println(`Warning: ACF using it wrong`)
+		fmt.Println(`#0 callback("Memory Usage: 999mb")`)
+		fmt.Println("Memory Usage: 176.08mb (Peak: 177.58mb)")
+	}
 	if mode == "graceful" {
 		for i := 0; i < 500; i++ {
 			if _, err := os.Stat(filepath.Join(os.Getenv("VIP_SUPERVISOR_INDEX_DIR"), "stop-request")); err == nil {

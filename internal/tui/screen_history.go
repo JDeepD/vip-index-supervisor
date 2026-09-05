@@ -238,6 +238,9 @@ func (s *recoveryScreen) View() string {
 func (s *recoveryScreen) resumePrompt() string {
 	var b strings.Builder
 	b.WriteString("Resume this saved run?\n\n")
+	if s.run.Config.AggressiveRecovery {
+		b.WriteString("WARNING: This run uses AGGRESSIVE stale-lock recovery.\nUnchanged CLI state may be cleared while a worker is alive.\nResuming preserves this setting; continue only if you accept that risk.\n\n")
+	}
 	fmt.Fprintf(&b, "Target: %s\nOriginal strategy: %s\nPost types: %s\nPer page: %d\nBudget: %s (fresh allowance for this resume)\nState: %s\n\n",
 		s.run.Config.Target.Label(), s.run.Config.Strategy, displayPostTypes(s.run.Config.PostTypes), s.run.Config.PerPage, displayBudget(s.run.Config.MaxDuration), s.run.Config.StateDir)
 	for _, p := range s.run.Phases {

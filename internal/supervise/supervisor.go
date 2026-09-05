@@ -60,6 +60,7 @@ type searchClient interface {
 	AddVersion(context.Context, string) vipsearch.RunResult
 	ActivateVersion(context.Context, string, int) vipsearch.RunResult
 	ClearIndexLock(context.Context) vipsearch.RunResult
+	ClearSyncRecordGuarded(context.Context, func(context.Context) error) vipsearch.RunResult
 	StopIndexing(context.Context) vipsearch.RunResult
 	LastResult() vipsearch.RunResult
 }
@@ -180,6 +181,9 @@ func (s *Supervisor) Run(ctx context.Context) {
 	s.logf(LevelInfo, "===== supervisor start (target: %s, phases: %s, strategy: %s) =====",
 		s.cfg.Target.Label(), strings.Join(s.cfg.Indexables, ", "), s.cfg.Strategy)
 	s.notifyChange("Run started", "Starting "+strings.Join(s.cfg.Indexables, ", ")+" ("+s.cfg.Strategy.String()+").", 3, "arrow_forward")
+	if s.cfg.AggressiveRecovery {
+		s.logf(LevelWarn, "AGGRESSIVE stale-lock recovery enabled: unchanged CLI state may be cleared even though worker death cannot be proven")
+	}
 
 	if problems := s.preflight(ctx); len(problems) > 0 {
 		if s.finishInterrupted(ctx) {
@@ -280,8 +284,7 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 	}
 
 	noProgress := 0
-	lockErrors := 0
-	clearedIdleLock := false
+	recoveryCycles := 0
 	backoff := s.cfg.BackoffBase
 	priorAttempts := s.phases[s.current].Attempt
 
@@ -315,10 +318,14 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 		}
 
 		before := s.lastObjectID()
+		beforeDone := s.phases[s.current].Done
 		outcome := s.attempt(ctx, indexable, version, args)
-		if outcome.success {
-			s.updatePhase(func(p *PhaseSnapshot) { p.IndexingComplete = true })
-		}
+		s.updatePhase(func(p *PhaseSnapshot) {
+			p.MemoryUsage = "" // the local indexing command has exited
+			if outcome.success {
+				p.IndexingComplete = true
+			}
+		})
 		if err := s.finishAttempt(outcome); err != nil {
 			s.logf(LevelError, "[%s] could not save attempt result: %v", indexable, err)
 			return false
@@ -340,51 +347,26 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 
 		s.updatePhase(func(p *PhaseSnapshot) { p.Restarts++ })
 
-		if outcome.lockError && !outcome.progressed {
-			lockErrors++
-			if lockErrors >= maxConsecutiveLockErrors {
-				// Cleanup is bounded to once, and only after known-idle status.
-				if !clearedIdleLock {
-					cleared, diagnosed := s.diagnoseBlockingSync(ctx, indexable)
-					if cleared {
-						clearedIdleLock = true
-						lockErrors = 0
-						if !s.wait(ctx, s.cfg.BackoffBase) {
-							return false
-						}
-						continue
-					}
-					if diagnosed {
-						return false // the failure was already explained
-					}
-				}
-				s.reportPersistentLock(ctx, indexable, clearedIdleLock)
-				return false
-			}
-			lockWait := lockRetryDelay(lockErrors)
-			s.setStatusNote("index lock reported — waiting")
-			s.logf(LevelWarn, "[%s] index lock reported — retrying in %s without changing remote state", indexable, lockWait)
-			s.notifyRetry(indexable, "Index lock reported; retrying in "+lockWait.String()+" without clearing remote state.")
-			if !s.wait(ctx, lockWait) {
-				return false
-			}
-			continue // a stale lock is not a failed attempt
-		}
-		lockErrors = 0
-		if setupPending && !outcome.progressed {
+		if setupPending && !outcome.progressed && !outcome.lockError {
 			s.logf(LevelError, "[%s] --setup exited before confirming progress; setup may be incomplete. Inspect %s before choosing rebuild or resume.", indexable, outcome.logPath)
 			return false
 		}
-		setupPending = false
-
+		if outcome.progressed {
+			setupPending = false
+		}
 		after := s.lastObjectID()
-		progressed := after != vipsearch.NoValue && (before == vipsearch.NoValue || after < before)
+		// Prefer checkpoint movement when IDs are available. Replaying a
+		// boundary batch or a drifting total can increase the displayed count
+		// without advancing the resume point, and must not renew the budget.
+		progressed := (after > 0 && (before <= 0 || after < before)) ||
+			(after <= 0 && s.phases[s.current].Done > beforeDone)
 		if progressed {
+			recoveryCycles = 0
 			noProgress = 0
 			backoff = s.cfg.BackoffBase
 			s.logf(LevelWarn, "[%s] stopped (%s); progressed to id %s — retrying in %s",
 				indexable, outcome.exitNote(), formatInt(after), backoff)
-		} else {
+		} else if !outcome.lockError {
 			noProgress++
 			s.logf(LevelWarn, "[%s] stopped (%s) with no progress (%d/%d)",
 				indexable, outcome.exitNote(), noProgress, s.cfg.NoProgressAbort)
@@ -396,9 +378,15 @@ func (s *Supervisor) runPhase(ctx context.Context, indexable string) bool {
 			backoff = min(backoff*2, s.cfg.BackoffMax)
 		}
 
+		if !s.recoverForRetry(ctx, indexable, version, outcome.lockError, &recoveryCycles) {
+			return false
+		}
 		s.setStatusNote("retrying in " + backoff.String())
 		s.notifyRetry(indexable, "Indexing attempt ended; retrying in "+backoff.String()+" from the saved checkpoint.")
 		if !s.wait(ctx, backoff) {
+			return false
+		}
+		if !s.retryReadyNow(ctx, indexable, version) {
 			return false
 		}
 	}
@@ -449,115 +437,14 @@ func (s *Supervisor) completePhase(ctx context.Context, indexable string, versio
 	return true
 }
 
-// Lock refusals get two waits before diagnosis. They are not proof of a dead
-// worker, so neither wait deletes any state.
-const (
-	maxConsecutiveLockErrors = 3
-	maxLockRetryDelay        = time.Minute
-)
-
-// lockRetryDelay is deliberately separate from the general failure backoff.
-// A stale lock gets two bounded chances to disappear before the third error
-// moves into the existing remote-sync diagnosis path.
-func lockRetryDelay(consecutive int) time.Duration {
-	if consecutive <= 0 {
-		return 0
-	}
-	delay := 10 * time.Second
-	if consecutive >= 2 {
-		delay = 30 * time.Second
-	}
-	return min(delay, maxLockRetryDelay)
-}
-
-// Identical status in this window is not proof that a remote process is dead.
-const syncFreezeProbeDelay = 15 * time.Second
-
-// diagnoseBlockingSync never deletes state reported as active or unknown.
-// Two reads distinguish movement from apparent inactivity, not live from dead.
-//
-// cleared says the block is gone; diagnosed says the situation was already
-// explained to the user, so the caller must not add a second, vaguer verdict.
-func (s *Supervisor) diagnoseBlockingSync(ctx context.Context, indexable string) (cleared, diagnosed bool) {
-	first := s.client.Status(ctx)
-	if first == nil {
-		return false, false
-	}
-	if !first.Indexing {
-		return s.clearIdleLock(ctx, indexable), true
-	}
-	s.setStatusNote("blocking sync found — probing whether it is alive")
-	s.logf(LevelInfo, "[%s] a %s sync reports in-progress — re-reading status in %s to see if it is advancing",
-		indexable, syncMethod(first), syncFreezeProbeDelay)
-	if !s.wait(ctx, syncFreezeProbeDelay) {
-		return false, true
-	}
-	second := s.client.Status(ctx)
-	if second == nil {
-		return false, false
-	}
-	if !second.Indexing {
-		return s.clearIdleLock(ctx, indexable), true
-	}
-	if syncFingerprint(first) != syncFingerprint(second) {
-		s.logf(LevelError, "[%s] blocking sync changed during the probe; leaving it untouched. Let it finish before resuming.", indexable)
-		return false, true
-	}
-	s.logf(LevelWarn,
-		"[%s] blocking %s sync showed no movement in %s (%s). This does not prove it is dead; no remote state was cleared. Confirm no indexer is running before using unlock, then resume.",
-		indexable, syncMethod(second), syncFreezeProbeDelay, syncFingerprint(second))
-	return false, true
-}
-
-func (s *Supervisor) clearIdleLock(ctx context.Context, indexable string) bool {
-	if ctx.Err() != nil || s.stopRequested() {
-		return false
-	}
-	res := s.client.ClearIndexLock(ctx)
-	if res.Succeeded() {
-		s.logf(LevelInfo, "[%s] status reports idle; delete-transient acknowledged, retrying once more", indexable)
-		return true
-	}
-	for _, line := range res.DescribeFailure() {
-		s.logf(LevelWarn, "[%s] cleanup: %s", indexable, line)
-	}
-	return false
-}
-
-func (s *Supervisor) reportPersistentLock(ctx context.Context, indexable string, alreadyCleared bool) {
-	st := s.client.Status(ctx)
-	switch {
-	case st != nil && st.Indexing && alreadyCleared:
-		s.logf(LevelError,
-			"[%s] still locked after an idle-state cleanup — investigate on the platform side (%s get-indexing-status), then re-run.",
-			indexable, s.commandHint())
-	case st != nil && st.Indexing:
-		s.logf(LevelError,
-			"[%s] the index lock persists and the platform reports indexing. Inspect it (%s get-indexing-status); do not clear its state without confirming the worker has stopped.",
-			indexable, s.commandHint())
-	case st != nil:
-		s.logf(LevelError,
-			"[%s] the index lock keeps reappearing even though status reports idle — clear it manually (`unlock` action) and investigate before re-running.",
-			indexable)
-	default:
-		s.logf(LevelError,
-			"[%s] the index lock persists and the indexing status could not be read — investigate on the platform side, then re-run.",
-			indexable)
-	}
-}
-
 func syncFingerprint(st *vipsearch.IndexingStatus) string {
 	// Include sync identity and every counter independently; max(a,b) hides
 	// movement in the smaller counter and changes between phases/workers.
-	data, _ := json.Marshal(st)
+	data, _ := json.Marshal(struct {
+		*vipsearch.IndexingStatus
+		Raw map[string]any `json:"raw,omitempty"`
+	}{st, st.Raw})
 	return string(data)
-}
-
-func syncMethod(st *vipsearch.IndexingStatus) string {
-	if st.Method == "" {
-		return "background"
-	}
-	return st.Method
 }
 
 // Only a local, scoped checkpoint is suitable for automatic resume. The
@@ -898,6 +785,11 @@ func (s *Supervisor) consumeLine(indexable string, version int, line string, out
 }
 
 func (s *Supervisor) applyProgress(indexable string, version int, p vipsearch.Progress) error {
+	if p.MemoryUsage != "" {
+		// Memory is telemetry only: it must not advance checkpoints, renew
+		// recovery budgets, or trigger completion milestones.
+		s.updatePhase(func(ph *PhaseSnapshot) { ph.MemoryUsage = p.MemoryUsage })
+	}
 	if p.Done == vipsearch.NoValue && p.Total == vipsearch.NoValue && p.LastObjectID == vipsearch.NoValue {
 		return nil // diagnostic output must not flood the UI event queue
 	}
@@ -958,6 +850,7 @@ func (s *Supervisor) beginPhase(i int) {
 	s.attemptDone = vipsearch.NoValue
 	s.attemptTotal = vipsearch.NoValue
 	p := &s.phases[i]
+	p.MemoryUsage = ""
 	p.Status = PhaseRunning
 	p.StatusNote = "starting"
 	s.phaseStart = time.Now()
@@ -969,6 +862,7 @@ func (s *Supervisor) nextAttempt() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.phases[s.current].Attempt++
+	s.phases[s.current].MemoryUsage = ""
 	s.attemptDone, s.attemptTotal = vipsearch.NoValue, vipsearch.NoValue
 	s.samples = nil
 	return s.phases[s.current].Attempt

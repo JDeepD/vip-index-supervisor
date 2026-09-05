@@ -69,6 +69,9 @@ func (s *runScreen) SetSize(w, h int) {
 // terminal shows fewer lines instead of overflowing the screen.
 func (s *runScreen) logHeight() int {
 	reserved := 8 + len(s.state.Phases)
+	if s.state.Current >= 0 && s.state.Current < len(s.state.Phases) {
+		reserved++ // current-memory line in progressView
+	}
 	return max(3, s.height-reserved)
 }
 
@@ -270,7 +273,12 @@ func (s *runScreen) progressView() string {
 	if p.Restarts > 0 {
 		details += fmt.Sprintf(" (%d restarts)", p.Restarts)
 	}
-	b.WriteString(styleDim.Render(details) + "\n\n")
+	b.WriteString(styleDim.Render(details) + "\n")
+	memory := p.MemoryUsage
+	if memory == "" {
+		memory = "—"
+	}
+	b.WriteString(styleDim.Render("  memory "+memory) + "\n\n")
 	return b.String()
 }
 

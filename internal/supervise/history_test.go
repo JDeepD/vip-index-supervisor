@@ -78,6 +78,30 @@ func TestRunHistoryRecordsSettingsProgressAndAttempts(t *testing.T) {
 	}
 }
 
+func TestAggressiveRecoveryPersistsWithoutBypassingSavedRunChecks(t *testing.T) {
+	_, r := failedSavedRun(t, StrategyResume)
+	r.Config.AggressiveRecovery = true
+	if err := saveRun(r); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadRun(r.Config.StateDir, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ResumeConfig(loaded, notify.Config{})
+	if err != nil || !cfg.AggressiveRecovery {
+		t.Fatalf("explicit recovery setting lost: %v %+v", err, cfg)
+	}
+	client := localRecoveryClient()
+	client.statuses = []*vipsearch.IndexingStatus{frozenCLI()}
+	if report := InspectRecovery(context.Background(), loaded, client); report.CanResume {
+		t.Fatal("aggressive setting bypassed read-only saved-run ownership checks")
+	}
+	if client.clears != 0 || client.syncClears != 0 {
+		t.Fatal("saved-run inspection performed cleanup")
+	}
+}
+
 func TestSavedRunResumeUsesExactScopeWithoutRepeatingSetup(t *testing.T) {
 	for _, strategy := range []Strategy{StrategySetup, StrategyResume, StrategyNewVersion, StrategyIntoVersion} {
 		t.Run(strategy.String(), func(t *testing.T) {

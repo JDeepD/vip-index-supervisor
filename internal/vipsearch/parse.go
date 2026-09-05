@@ -17,6 +17,7 @@ var (
 	reProgressSlash = regexp.MustCompile(`(?i)^\s*Processed\s+(\d+)\s*/\s*(\d+)\.?(?:\s+Last Object ID:\s*(\d+))?\s*$`)
 	reLastObjectID  = regexp.MustCompile(`(?i)^\s*Last Object ID:\s*(\d+)\s*$`)
 	reIndexedCount  = regexp.MustCompile(`(?i)^\s*Number of \w+ indexed:\s*(\d+)\s*$`)
+	reMemoryUsage   = regexp.MustCompile(`(?i)^\s*Memory Usage:\s*(\d+(?:\.\d+)?)\s*mb(?:\s+\(Peak:\s*\d+(?:\.\d+)?\s*mb\))?\s*$`)
 	reANSI          = regexp.MustCompile(`\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]`)
 	reLockError     = regexp.MustCompile(`(?i)^\s*Error:\s*An index is already occurring\b`)
 	reIndexSuccess  = regexp.MustCompile(`(?i)^\s*Success:\s*Done!\s*$`)
@@ -48,6 +49,7 @@ type Progress struct {
 	Total        int64
 	LastObjectID int64
 	IndexedCount int64
+	MemoryUsage  string // current indexer usage in MB; empty when absent, never the peak
 }
 
 // NoValue marks an absent field in Progress.
@@ -79,6 +81,11 @@ func ParseProgress(line string) Progress {
 	}
 	if m := reIndexedCount.FindStringSubmatch(line); m != nil {
 		p.IndexedCount = toInt64(m[1])
+	}
+	if m := reMemoryUsage.FindStringSubmatch(line); m != nil {
+		if _, err := strconv.ParseFloat(m[1], 64); err == nil {
+			p.MemoryUsage = m[1] + " MB"
+		}
 	}
 	return p
 }

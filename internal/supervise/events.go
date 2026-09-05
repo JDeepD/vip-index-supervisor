@@ -34,6 +34,7 @@ type PhaseSnapshot struct {
 	Done                int64
 	Total               int64
 	LastObjectID        int64
+	MemoryUsage         string  `json:"-"` // latest CLI reading for this attempt; not resumable state
 	Rate                float64 // objects/second, trailing window
 	ETA                 time.Duration
 	Elapsed             time.Duration

@@ -182,7 +182,7 @@ func TestCountReportNeedsEvidence(t *testing.T) {
 }
 
 func FuzzParsers(f *testing.F) {
-	for _, s := range []string{diagnosticNoise, `{"indexing":true}`, "Processed 300/9000. Last Object ID: 8999", "\x1b[32mSuccess: Done!"} {
+	for _, s := range []string{diagnosticNoise, `{"indexing":true}`, "Processed 300/9000. Last Object ID: 8999", "\x1b[32mSuccess: Done!", "Memory Usage: 171.99mb (Peak: 173.43mb)", "Active features:\nusers\nterms\n"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
@@ -191,6 +191,8 @@ func FuzzParsers(f *testing.F) {
 		}
 		parseStatus(s)
 		ParseProgress(s)
+		parseFeatureList(s, "Active features:")
+		parseFeatureList(s, "Registered features:")
 		ClassifyFatal(s)
 		var value any
 		ExtractJSON(s, &value)

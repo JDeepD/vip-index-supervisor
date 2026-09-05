@@ -108,9 +108,17 @@ Just run the binary — everything is interactive:
   (a second ctrl+c force-kills); the run log scrolls with **↑/↓ / pgup/pgdn**
 - `vip-index-supervisor --version` prints the release the binary was built from
 
+The indexing dashboard shows current memory usage reported by the indexer's
+`Memory Usage:` lines, for example `memory 171.99 MB`. It updates whenever a new
+reading arrives, displays `—` before the first reading, and clears between
+attempts. This is the indexer's reported usage, not the supervisor's memory or
+the peak value; it is display-only and does not change retry behavior.
+
 The options step has an **Advanced ▸** screen for the rare overrides: a forced
 resume object ID, a custom state directory, the stall timeout, and ignoring
-the state-dir lock. Attempt logs older than 14 days are pruned automatically
+the state-dir lock. It also offers **Aggressive stale-lock recovery**, off by
+default; read the safety limits under [Failure handling](#failure-handling)
+before enabling it. Attempt logs older than 14 days are pruned automatically
 at the start of each run.
 
 The first screen picks how WordPress is reached:
@@ -133,12 +141,32 @@ Then an action:
 | health   | is the active index populated? do counts align?      |
 | counts   | DB vs ES document counts                             |
 | versions | browse versions: activate, delete, or build into one |
+| features | activate the users, terms, or comments indexing feature |
 | unlock   | clear a stale index lock (delete-transient)          |
 | stop     | ask a running index to stop                          |
 | notifications | configure ntfy phone alerts and send a test     |
 
 The exact command the wizard's answers produce is shown before anything runs,
 so the flags stay learnable rather than hidden.
+
+## Activating optional indexables
+
+Open **features** from the action menu, or press **f** on the **Which
+indexables?** screen. It lists `users`, `terms`, and `comments` as active,
+inactive, or unavailable on the selected target. Unknown CLI output is an
+error, not an inactive feature.
+
+Select an inactive feature, review the `activate-feature` command, then
+explicitly confirm (Cancel is the default). Production-looking VIP targets
+also require typing the environment name. Immediately before activation, the
+tool rechecks availability and requires idle indexing. It will not clear a
+lock to enable a feature. Afterward, it verifies both the active feature and
+registration of its corresponding `user`, `term`, or `comment` indexable.
+
+Activation changes the target's feature settings but does **not** start an
+indexing run, rebuild an index, change your selected phases, or deactivate any
+feature. Return to **index** and select the desired indexables when ready.
+Features absent from the target's registered list cannot be activated here.
 
 ## Saved runs and recovery
 
@@ -188,6 +216,9 @@ Resuming creates a new history entry linked to the original. Progress and
 milestone state are carried forward; the saved time budget and retry allowance
 apply afresh to this resume. Notifications use the current session's settings.
 Direct WP runs must be resumed from the original working directory.
+An explicitly enabled aggressive-recovery setting is preserved and shown in
+the resume confirmation. It does not bypass the history screen's read-only
+checks: active or unknown remote status still blocks starting a saved run.
 
 Records live at `<state-dir>/runs/<run-id>.json`; `runs/latest` identifies the
 newest run independently of wall-clock changes. History is not automatically
@@ -353,20 +384,54 @@ use an explicit resume ID only after verifying its target/version/filter.
 
 | situation                                   | response                                            |
 |---------------------------------------------|-----------------------------------------------------|
-| lock refusal before progress               | wait 10s after the first error and 30s after the second, then retry without deleting remote state |
-| third consecutive lock refusal             | diagnose the sync; known-idle status permits one cleanup, while active or unknown state is left untouched. No movement in 15s is not proof of a dead worker |
-| process died, progress was made             | resume from the checkpoint, reset backoff           |
-| process died, no progress                   | exponential backoff, abort after 5 fruitless tries  |
+| first retryable failure, including a lock refusal | read status twice, 30s apart; inspect available counters, last-object ID, and worker identity before any retry |
+| status unknown, or an active worker changes | stop without further cleanup; investigate before resuming |
+| status idle but the attempt reported a lock | recheck version/status, run delete-transient, verify idle again, then retry |
+| unchanged active CLI state                  | default: stop without clearing; explicit aggressive mode permits guarded cleanup (see below) |
+| five recovery cycles without indexing progress | stop; a successful deletion alone does not reset this limit |
+| process died, progress was made             | diagnose remote state, resume the same checkpoint/version when idle, reset backoff and recovery budget |
+| process died, no progress and no lock error | diagnose before retry; exponential backoff, abort after 5 fruitless attempts |
 | no output for 10 minutes                    | probe remote progress before stopping the local process tree; do not erase remote sync metadata |
 | bad flag, unknown post type, expired auth   | abort immediately — retrying cannot help            |
 | wall-clock budget reached                   | stop at a checkpoint so a re-run resumes            |
 | new version failed verification             | old index stays active; pin kept for manual review  |
 | second ctrl+c                               | skip the grace period and force-kill the tree       |
 
-Progress resets the lock-error sequence. A local VIP-CLI exit is not proof
-that its remote worker has stopped. If diagnosis leaves a lock in place,
+The 30-second window is an observation interval, not a total recovery timeout:
+CLI reads, cleanup commands, and retry backoff take additional time. Retryable
+failures are checked from the first failure, not only after repeated lock
+errors. Cancellation, non-retryable errors, and ambiguous setup failures do not
+enter automatic cleanup.
+
+**Conservative recovery is the default.** A local VIP-CLI exit or unchanged
+status for 30 seconds is not proof that its remote worker has stopped. If
+diagnosis leaves a lock in place,
 confirm that no indexer is running before using **unlock**, then **resume the
 same version**; a lock alone is not a reason to rebuild with `--setup`.
+
+For unattended runs where you control all indexers on the target, **Advanced ▸
+→ Aggressive stale-lock recovery** explicitly accepts the risk of clearing a
+live but quiet worker's state. Production-looking VIP targets require typed
+confirmation; this mode cannot be combined with ignoring the local state lock.
+That lock only coordinates supervisors using the same local state directory,
+not remote workers or other machines.
+
+In aggressive mode, unchanged active **CLI** status must have usable counters
+and no conflicting scope. Recovery first runs `delete-transient` and checks
+status immediately afterward. If the same active state remains, it observes
+another 30 seconds before trying the known sync transients, `ep_index_meta`
+options, and their option-cache keys. Every individual cleanup command has a
+fresh version/status guard; a new worker, movement, unknown state, or command
+failure stops further cleanup. Already-absent option/transient warnings do not
+prevent cache cleanup. Once idle is observed, remaining cleanup is skipped.
+
+Every retry also rechecks the selected version and idle status **after** its
+backoff. Unresolved recovery is capped at five consecutive cycles. Only actual
+checkpoint advancement (or increasing processed counts when no IDs are
+available) resets that budget—not deletion acknowledgements or replaying a
+checkpoint boundary. These checks reduce races; they cannot atomically prove
+remote ownership or guarantee overnight completion. They do not prevent PHP
+memory exhaustion or implement memory-based worker rotation.
 
 Unrelated PHP/ACF warnings and stack traces are retained in attempt logs but
 do not count as progress, completion, locks, or authorization failures. JSON
@@ -408,8 +473,14 @@ timeouts, redirects, secret handling, retry rate limits, queue saturation,
 final-alert ordering, settings persistence, UI configuration, and run outcomes.
 Recovery tests cover exact-scope resume, completed-phase skipping, active or
 unknown workers, changed versions/pins, corrupt or superseded history, runtime
-revalidation, interrupted registration, and clock rollback. Milestone tests
-cover count-based thresholds, retries/resumes, unknown totals, overflow, and
+revalidation, interrupted registration, and clock rollback.
+Automatic lock-recovery tests cover 30-second observations, five-cycle limits,
+real versus replayed progress, opt-in risk warnings, malformed counters,
+per-command cleanup guards, late workers, and cancellation during status reads.
+Feature tests cover noisy listings, confirmation and production guards,
+active/unknown indexing, already-active and unavailable features, failed
+activation, and verification of the resulting indexable, using fake CLI only.
+Milestone tests cover count-based thresholds, retries/resumes, unknown totals, overflow, and
 failed verification at apparent 100%.
 CI runs tests before releases.
 
@@ -430,6 +501,7 @@ internal/vipsearch/        command construction + output parsing
 internal/childproc/        process-tree cancellation and termination per OS
 internal/supervise/        the engine
   supervisor.go            phase/attempt loop, stall watchdog, backoff
+  lock_recovery.go         bounded status diagnosis and opt-in guarded cleanup
   checkpoint.go            scoped, atomic checkpoint files
   versions.go              new-version create / verify / activate
   lock.go                  single-instance state-dir lock
@@ -443,5 +515,6 @@ internal/tui/              Bubble Tea front-end
   screen_run.go            live supervision dashboard
   screen_output.go         read-only commands, watch, unlock
   screen_notifications.go  optional ntfy configuration and test message
+  screen_features.go       confirmed activation of optional indexing features
   screen_history.go        saved run browser, recovery details, resume confirmation
 ```

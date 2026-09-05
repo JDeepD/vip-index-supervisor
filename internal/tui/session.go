@@ -29,10 +29,11 @@ type session struct {
 	notificationLoadError string
 
 	// advanced options; zero values mean "use the defaults"
-	resumeFrom   int64
-	stateDir     string
-	stallTimeout time.Duration
-	ignoreLock   bool
+	resumeFrom         int64
+	stateDir           string
+	stallTimeout       time.Duration
+	ignoreLock         bool
+	aggressiveRecovery bool
 }
 
 func newSession() *session {
@@ -57,19 +58,20 @@ func (s *session) client() *vipsearch.Client { return vipsearch.NewClient(s.targ
 
 func (s *session) config() supervise.Config {
 	cfg := supervise.Config{
-		Target:        s.target,
-		Indexables:    s.indexables,
-		PostTypes:     s.postTypes,
-		PerPage:       s.perPage,
-		Strategy:      s.strategy,
-		IntoVersion:   s.intoVersion,
-		ResumeFrom:    s.resumeFrom,
-		ShowErrors:    s.showErrors,
-		MaxDuration:   s.maxDuration,
-		StateDir:      s.stateDir,
-		StallTimeout:  s.stallTimeout,
-		IgnoreLock:    s.ignoreLock,
-		Notifications: s.notifications,
+		Target:             s.target,
+		Indexables:         s.indexables,
+		PostTypes:          s.postTypes,
+		PerPage:            s.perPage,
+		Strategy:           s.strategy,
+		IntoVersion:        s.intoVersion,
+		ResumeFrom:         s.resumeFrom,
+		ShowErrors:         s.showErrors,
+		MaxDuration:        s.maxDuration,
+		StateDir:           s.stateDir,
+		StallTimeout:       s.stallTimeout,
+		IgnoreLock:         s.ignoreLock,
+		AggressiveRecovery: s.aggressiveRecovery,
+		Notifications:      s.notifications,
 	}
 	cfg.Normalize()
 	return cfg

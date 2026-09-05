@@ -108,6 +108,7 @@ func newActionScreen(sess *session) *actionScreen {
 		{Value: "health", Label: "health", Desc: "is the active index populated? do counts align?"},
 		{Value: "counts", Label: "counts", Desc: "DB vs ES document counts (slow)"},
 		{Value: "versions", Label: "versions", Desc: "browse versions: activate, delete, or build into one"},
+		{Value: "features", Label: "features", Desc: "activate users, terms, or comments before indexing them"},
 		{Value: "unlock", Label: "unlock", Desc: "clear a stale index lock (delete-transient)"},
 		{Value: "stop", Label: "stop", Desc: "ask a running index to stop"},
 		{Value: "notifications", Label: "notifications", Desc: "configure ntfy phone alerts and send a test"},
@@ -140,6 +141,8 @@ func (s *actionScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		return s, push(newIndexablesScreen(s.sess))
 	case "versions":
 		return s, push(newVersionsIndexableScreen(s.sess))
+	case "features":
+		return s, push(newFeaturesScreen(s.sess))
 	case "watch":
 		return s, push(newWatchScreen(s.sess))
 	case "unlock":
@@ -188,6 +191,9 @@ func (s *indexablesScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	if !ok {
 		return s, nil
 	}
+	if key.String() == "f" {
+		return s, push(newFeaturesScreen(s.sess))
+	}
 	if !s.multi.Update(key) {
 		return s, nil
 	}
@@ -204,7 +210,7 @@ func (s *indexablesScreen) View() string {
 	return styleHeading.Render("Which indexables?") + "\n" +
 		styleDim.Render("Each becomes its own supervised phase with its own resume checkpoint.") + "\n\n" +
 		s.multi.View() +
-		styleHelp.Render("↑/↓ move · space toggle · a all · enter continue · esc back")
+		styleHelp.Render("↑/↓ move · space toggle · a all · f activate features · enter continue · esc back")
 }
 
 // newPostTypesScreen takes its successor as a parameter because two wizards
@@ -358,6 +364,7 @@ const (
 	advStateDir
 	advStallTimeout
 	advIgnoreLock
+	advAggressiveRecovery
 )
 
 type advancedScreen struct {
@@ -376,6 +383,7 @@ func newAdvancedScreen(sess *session) *advancedScreen {
 			{label: "Stall timeout (e.g. 10m)", kind: kindText,
 				text: textIfDuration(sess.stallTimeout), placeholder: "default: 10m"},
 			{label: "Ignore the state-dir lock", kind: kindToggle, on: sess.ignoreLock},
+			{label: "Aggressive stale-lock recovery", kind: kindToggle, on: sess.aggressiveRecovery},
 		},
 		actions: []string{"Done ✓"},
 	}}
@@ -400,6 +408,11 @@ func (s *advancedScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 }
 
 func (s *advancedScreen) apply() bool {
+	if s.form.fields[advAggressiveRecovery].on && s.form.fields[advIgnoreLock].on {
+		s.errText = "aggressive recovery requires the state-directory lock"
+		s.form.FocusField(advIgnoreLock)
+		return false
+	}
 	resumeText := strings.TrimSpace(s.form.fields[advResumeFrom].text)
 	var resumeFrom int64
 	if resumeText != "" {
@@ -431,6 +444,7 @@ func (s *advancedScreen) apply() bool {
 	s.sess.stateDir = strings.TrimSpace(s.form.fields[advStateDir].text)
 	s.sess.stallTimeout = stall
 	s.sess.ignoreLock = s.form.fields[advIgnoreLock].on
+	s.sess.aggressiveRecovery = s.form.fields[advAggressiveRecovery].on
 	return true
 }
 
@@ -439,6 +453,9 @@ func (s *advancedScreen) View() string {
 	b.WriteString(styleHeading.Render("Advanced options") + "\n")
 	b.WriteString(styleDim.Render("Defaults are right for almost every run; change these only on purpose.") + "\n\n")
 	b.WriteString(s.form.View())
+	if s.form.fields[advAggressiveRecovery].on {
+		b.WriteString("\n" + styleWarn.Render("Aggressive recovery may clear a LIVE worker's state after 30s without movement.\nUse only when you accept that risk and control all indexers on this target.") + "\n")
+	}
 	if s.errText != "" {
 		b.WriteString("\n" + styleErr.Render("  ✗ "+s.errText) + "\n")
 	}
@@ -480,7 +497,7 @@ func (s *confirmScreen) Title() string { return "confirm" }
 func (s *confirmScreen) Init() tea.Cmd { return nil }
 
 func (s *confirmScreen) needsProductionGuard() bool {
-	return s.sess.strategy == supervise.StrategySetup && s.sess.target.LooksLikeProduction()
+	return (s.sess.strategy == supervise.StrategySetup || s.sess.aggressiveRecovery) && s.sess.target.LooksLikeProduction()
 }
 
 func (s *confirmScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
@@ -575,7 +592,12 @@ func (s *confirmScreen) View() string {
 	if s.sess.ignoreLock {
 		b.WriteString(styleWarn.Render("  lock         IGNORED — concurrent runs corrupt checkpoints") + "\n")
 	}
-	b.WriteString(styleDim.Render("  a deploy or crash mid-run is fine — the supervisor resumes from the last object id\n"))
+	if s.sess.aggressiveRecovery {
+		b.WriteString(styleWarn.Render("  recovery     AGGRESSIVE — unchanged CLI state may be cleared while a worker is alive") + "\n")
+	} else {
+		b.WriteString("  recovery     conservative — active or unknown state will not be cleared\n")
+	}
+	b.WriteString(styleDim.Render("  retries use the saved checkpoint; uncertain remote state can require investigation\n"))
 
 	if s.sess.strategy == supervise.StrategySetup {
 		b.WriteString("\n" + styleErr.Render("  ⚠ rebuild in place EMPTIES the live index until the rebuild finishes") + "\n")
@@ -583,7 +605,11 @@ func (s *confirmScreen) View() string {
 	b.WriteString("\n")
 
 	if s.guardOpen {
-		b.WriteString(styleErr.Render("  --setup will DELETE the live index on "+s.sess.target.AppEnv) + "\n\n")
+		if s.sess.strategy == supervise.StrategySetup {
+			b.WriteString(styleErr.Render("  --setup will DELETE the live index on "+s.sess.target.AppEnv) + "\n\n")
+		} else {
+			b.WriteString(styleWarn.Render("  Aggressive recovery can clear a live worker's state on "+s.sess.target.AppEnv) + "\n\n")
+		}
 		b.WriteString(s.guard.View())
 		return b.String()
 	}

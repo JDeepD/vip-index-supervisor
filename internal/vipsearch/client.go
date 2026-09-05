@@ -337,6 +337,19 @@ var reSyncCleared = regexp.MustCompile(`(?mi)^\s*(?:Sync|Index) cleared\.\s*$`)
 // CLI died: the remote worker could still be running. Keep all failures, not
 // just the final cache command's result.
 func (c *Client) ClearSyncRecord(ctx context.Context) RunResult {
+	return c.clearSyncRecord(ctx, nil)
+}
+
+// ClearSyncRecordGuarded revalidates authorization before EACH mutation and
+// stops at the first failed command. The manual unlock action remains separate.
+func (c *Client) ClearSyncRecordGuarded(ctx context.Context, guard func(context.Context) error) RunResult {
+	if guard == nil {
+		return RunResult{Err: errors.New("automatic sync cleanup requires a guard")}
+	}
+	return c.clearSyncRecord(ctx, guard)
+}
+
+func (c *Client) clearSyncRecord(ctx context.Context, guard func(context.Context) error) RunResult {
 	// Order matters. The object-cache deletes come last and are NOT optional:
 	// delete_option() looks up the database row first and returns early when
 	// it is missing, before it ever calls wp_cache_delete(). So once the row
@@ -358,12 +371,32 @@ func (c *Client) ClearSyncRecord(ctx context.Context) RunResult {
 	}
 	var result RunResult
 	for _, args := range cleanups {
+		if ctx.Err() != nil {
+			result.Err = errors.Join(result.Err, ctx.Err())
+			break
+		}
+		if guard != nil {
+			if err := guard(ctx); err != nil {
+				result.Err = errors.Join(result.Err, err)
+				break
+			}
+		}
+		if ctx.Err() != nil {
+			result.Err = errors.Join(result.Err, ctx.Err())
+			break
+		}
 		res := c.Target.RunWP(ctx, 2*time.Minute, args...)
 		result.Output += fmt.Sprintf("%s\n%s\n", strings.Join(args, " "), res.Output)
 		result.NotFound = result.NotFound || res.NotFound
 		result.TimedOut = result.TimedOut || res.TimedOut
 		if res.Err != nil {
 			result.Err = errors.Join(result.Err, res.Err)
+		}
+		if guard != nil && res.Failed() {
+			if result.Err == nil {
+				result.Err = errors.New("sync cleanup command reported failure")
+			}
+			break
 		}
 		if ctx.Err() != nil {
 			break
